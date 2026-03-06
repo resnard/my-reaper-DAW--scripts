@@ -1,10 +1,11 @@
 -- REAPER 7 - Marker Template Manager Pro
 -- Clean toolbar, tooltips, import/export, search filter, focus mode
--- Author: Based on community contributions
+-- Prompt Author: Res
+-- Code Author: Deep Seek AI
 -- Description: Manage marker templates with color, name, navigation, import/export,
 --              search, and focus mode. Double‑click to edit, use [ ] to cycle markers.
 
-local SCRIPT_NAME = "Marker Templates Pro"
+local SCRIPT_NAME = "Marker Template Manager by Res"
 local ctx = reaper.ImGui_CreateContext(SCRIPT_NAME)
 
 --------------------------------------------------------
@@ -262,14 +263,34 @@ end
 --------------------------------------------------------
 
 -- Save all templates to a user‑chosen text file (tab‑separated: name R G B)
+-- Export all templates to a user‑chosen text file
 local function export_all_templates()
-  local retval, path = reaper.GetUserFileNameForWrite("Save Templates", "Templates", ".txt")
+  -- Use JS_Dialog_BrowseForSaveFile (requires js_ReaScriptAPI)
+  if not reaper.APIExists("JS_Dialog_BrowseForSaveFile") then
+    reaper.ShowConsoleMsg("Error: js_ReaScriptAPI extension is required for export.\n")
+    return
+  end
+
+  local retval, path = reaper.JS_Dialog_BrowseForSaveFile(
+    "Save Templates",           -- title
+    reaper.GetResourcePath(),   -- initial folder
+    "Templates",                -- default filename (without extension)
+    "Text file (*.txt)\0*.txt\0\0"  -- file filter
+  )
+
   if not retval or path == "" then return end
+
+  -- Ensure .txt extension
+  if not path:match("%.txt$") then
+    path = path .. ".txt"
+  end
+
   local f, err = io.open(path, "w")
   if not f then
     reaper.ShowConsoleMsg("Error saving: " .. (err or "unknown error") .. "\n")
     return
   end
+
   for _, t in ipairs(Model.templates) do
     f:write(string.format("%s\t%d\t%d\t%d\n", t.name, t.r, t.g, t.b))
   end
@@ -279,8 +300,14 @@ end
 
 -- Load templates from a user‑chosen text file and append them to the current list.
 local function import_templates()
-  local retval, path = reaper.GetUserFileNameForRead("Import Templates", ".txt")
+  -- Correct signature: GetUserFileNameForRead(title, defaultName, extensionList)
+  local retval, path = reaper.GetUserFileNameForRead(
+    "Import Templates",           -- title
+    "",                           -- default filename (none)
+    ".txt" -- file filter (double null terminated)
+  )
   if not retval or path == "" then return end
+
   local f, err = io.open(path, "r")
   if not f then
     reaper.ShowConsoleMsg("Error reading: " .. (err or "unknown error") .. "\n")
@@ -371,28 +398,6 @@ local function draw_toolbar()
       import_templates()
     end
     reaper.ImGui_Separator(ctx)
-
-    -- UI Scale slider – fallback to text input if SliderFloat not available.
-    if reaper.ImGui_SliderFloat then
-      local changed, new_scale = reaper.ImGui_SliderFloat(ctx, "UI Scale", Model.ui_scale, 0.8, 2.0, "%.2f")
-      if changed then
-        Model.ui_scale = new_scale
-        Model.dirty = true
-      end
-    else
-      reaper.ImGui_Text(ctx, "UI Scale:")
-      reaper.ImGui_SameLine(ctx)
-      local scale_str = string.format("%.2f", Model.ui_scale)
-      local changed, new_str = reaper.ImGui_InputText(ctx, "##scale_input", scale_str, 10)
-      if changed then
-        local num = tonumber(new_str)
-        if num then
-          num = math.max(0.5, math.min(3.0, num))
-          Model.ui_scale = num
-          Model.dirty = true
-        end
-      end
-    end
     reaper.ImGui_EndPopup(ctx)
   end
 
@@ -474,7 +479,7 @@ local function draw_list()
   -- Calculate table height dynamically so status bar always fits.
   local window_height = reaper.ImGui_GetWindowHeight(ctx)
   local current_y = reaper.ImGui_GetCursorPosY(ctx)
-  local status_height = 60   -- accounts for search bar and separator
+  local status_height = 20   -- accounts for search bar and separator
   local table_height = window_height - current_y - status_height - 10
   if table_height < 100 then table_height = 100 end
 
@@ -564,7 +569,7 @@ local function draw_list()
         reaper.ImGui_TableSetColumnIndex(ctx, 2)
         local markers = find_markers(template)
         local count = #markers
-        if is_selected then
+        if count > 0 then
           if reaper.ImGui_Button(ctx, "◀##prev" .. real_idx) then
             cycle_marker(real_idx, -1)
           end
@@ -597,13 +602,7 @@ local function draw_list()
           table.remove(Model.templates, confirm_delete.indices[i])
         end
         selected_indices = {}
-        if #Model.templates == 0 then
-          local def = RGB_COLORS.DEFAULT
-          table.insert(Model.templates, { name = "Marker", r = def[1], g = def[2], b = def[3] })
-          selected_indices = { 1 }
-        elseif #Model.templates > 0 then
-          selected_indices = { 1 }
-        end
+        
         Model.dirty = true
         confirm_delete = nil
         reaper.ImGui_CloseCurrentPopup(ctx)
@@ -710,14 +709,14 @@ local function draw_status()
 
   if Model.focus_mode then
     -- Show size of frozen focus set (not current selection)
-    reaper.ImGui_SameLine(ctx, 250)
+    reaper.ImGui_SameLine(ctx, 200)
     reaper.ImGui_Text(ctx, "Focus set: " .. #focus_set .. " items")
   elseif #selected_indices > 0 then
-    reaper.ImGui_SameLine(ctx, 300)
+    reaper.ImGui_SameLine(ctx, 200)
     reaper.ImGui_Text(ctx, #selected_indices .. " selected")
   end
 
-  reaper.ImGui_SameLine(ctx, 450)
+  reaper.ImGui_SameLine(ctx, 300)
   reaper.ImGui_TextDisabled(ctx, "[ ] to cycle")
 end
 
@@ -802,10 +801,7 @@ local function loop()
     reaper.ImGui_WindowFlags_NoCollapse())
 
   if visible then
-    -- Apply UI scale if the function exists (older ReaImGui may not have it)
-    if reaper.ImGui_SetWindowFontScale then
-      reaper.ImGui_SetWindowFontScale(ctx, Model.ui_scale)
-    end
+  
     handle_shortcuts()
     draw_toolbar()
     draw_list()
@@ -824,7 +820,7 @@ end
 --------------------------------------------------------
 load_model()
 local flt_min, flt_max = reaper.ImGui_NumericLimits_Float()
-reaper.ImGui_SetNextWindowSize(ctx, 600, 600, reaper.ImGui_Cond_FirstUseEver())
+reaper.ImGui_SetNextWindowSize(ctx, 300, 700, reaper.ImGui_Cond_FirstUseEver())
 reaper.ImGui_SetNextWindowPos(ctx, 100, 100, reaper.ImGui_Cond_FirstUseEver())
 reaper.ImGui_SetNextWindowSizeConstraints(ctx, 400, 250, flt_max, flt_max)
 reaper.defer(loop)

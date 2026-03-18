@@ -1,0 +1,397 @@
+/*
+  desc: BUM: Advanced Dynamics Strip (Full Control)
+  prompt author: Res 
+  coded by: Res, DeepSeek & GPT
+  - No presets, every parameter exposed
+  - Gate, Compressor, Tone shelf, Parallel, Limiter
+  - No look ahead
+  
+  BUM: Sugar and Ice Dynamic Strip is a fully exposed channel strip featuring a gate, compressor with soft knee and optional sidechain shaping,
+  dynamic tone shelf, parallel blend, auto makeup gain, and a safety limiter.
+  The signal flows through: gate → low-cut → compressor → dynamic tone → parallel mix → soft limiter → output.
+
+  It’s designed for precise, transparent dynamics control and clean gain staging, with no built-in presets or hidden processing.
+  It is not a lookahead, multiband, or character-modeling processor — 
+  and it does not aim to add coloration unless the tone stage is intentionally used.
+  
+*/
+
+desc: BUM: Sugar and Ice Dynamic Strip by Res
+slider1:0<0,1,1{Off,On}>Gate Enable
+slider2:-40<-80,0,0.1>Gate Threshold (dB)
+slider3:2<0.1,50,0.1>Gate Attack (ms)
+slider4:150<10,1000,1>Gate Release (ms)
+slider5:20<0,200,1>Gate Hold (ms)
+slider6:2<0,12,0.1>Gate Hysteresis (dB)
+slider7:80<20,1000,1>Gate SC Min (Hz)
+slider8:180<50,2000,1>Gate SC Max (Hz)
+
+slider9:0<0,1,1{Off,On}>Comp Enable
+slider10:-18<-60,0,0.1>Comp Threshold (dB)
+slider11:10<0.1,200,0.1>Comp Attack (ms)
+slider12:120<10,2000,1>Comp Release (ms)
+slider13:3<1,20,0.1>Comp Ratio
+slider14:6<0,24,0.1>Comp Knee (dB)
+slider15:0<0,1,1{Off,On}>Comp SC HPF Enable
+slider16:80<20,800,1>Comp SC HPF Freq (Hz)
+slider17:1<0,1,1{Unlinked,Linked}>Stereo Link
+
+slider18:0<0,1,1{Off,On}>Tone Enable
+slider19:0.5<-1,1,0.01>Tone Slope (-dB/+dB)
+slider20:3000<500,12000,1>Tone Freq (Hz)
+slider21:1<0,2,0.01>Tone Scale
+
+slider22:0<-12,12,0.1>Makeup Gain (dB)
+slider23:50<0,100,1>Parallel Mix (%)
+slider24:-6<-60,0,0.1>Limiter Threshold (dB)
+
+slider25:0<0,4,1{Normal,Gate SC,Gate Delta,Comp SC,Comp Delta}>Monitor
+monitor_mode = slider25;
+
+@init
+  eps = 0.000000001;
+  ln10 = log(10);
+
+  // Filter states
+  sc_lpL = sc_lpR = 0;
+  sc_hpL = sc_hpR = 0;
+  sc_prevL = sc_prevR = 0;
+  gate_envL = gate_envR = 0;
+  gate_timerL = gate_timerR = 0;
+  gate_openL = gate_openR = 0;
+  gate_gainL = gate_gainR = 1;
+
+  comp_envL = comp_envR = 0;
+  comp_gainL = comp_gainR = 1;
+
+  // Low cut HPF states (fixed at 20 Hz for safety, or could be made adjustable)
+  in_prevL = in_prevR = 0;
+  hp_prevL = hp_prevR = 0;
+
+  // Compressor sidechain HPF states
+  comp_sc_hp_prevL = comp_sc_hp_prevR = 0;
+  comp_sc_in_prevL = comp_sc_in_prevR = 0;
+
+  // Tone biquad states
+  tone_z1L = tone_z2L = 0;
+  tone_z1R = tone_z2R = 0;
+  tone_env = 0;
+  tone_update_counter = 0;
+
+  // Coefficients (default pass-through)
+  b0 = 1; b1 = 0; b2 = 0; a1 = 0; a2 = 0;
+
+  // Auto makeup (internal, always on)
+  auto_makeup = 0;
+
+  // Metering
+  gate_meter = 0;
+  comp_meter = 0;
+  tone_meter = 0;
+  ;
+function compute_gr(level_db, thresh_db, knee_db, ratio)
+(
+    delta = level_db - thresh_db;
+
+    delta <= -knee_db/2 ? 0 :
+    delta >=  knee_db/2 ? delta * (1 - 1/ratio) :
+    ((delta + knee_db/2) * (delta + knee_db/2) / (2*knee_db)) * (1 - 1/ratio);
+);
+
+@slider
+  // Gate parameters (sliders 1..8)
+  gate_enable      = slider1;
+  gate_thresh_db   = slider2;
+  gate_attack_ms   = slider3;
+  gate_release_ms  = slider4;
+  gate_hold_ms     = slider5;
+  gate_hyst_db     = slider6;
+  gate_sc_min      = slider7;
+  gate_sc_max      = slider8;
+
+  gate_attack_coef = exp(-1 / (gate_attack_ms * 0.001 * srate));
+  gate_release_coef= exp(-1 / (gate_release_ms * 0.001 * srate));
+  gate_hold_samples= floor(gate_hold_ms * 0.001 * srate);
+
+  sc_lp_coef = exp(-2 * $pi * gate_sc_max / srate);
+  sc_hp_coef = exp(-2 * $pi * gate_sc_min / srate);
+
+  // Compressor parameters (sliders 9..17)
+  comp_enable        = slider9;
+  comp_thresh_db     = slider10;
+  comp_attack_ms     = slider11;
+  comp_release_ms    = slider12;
+  comp_ratio         = slider13;
+  comp_knee_db       = slider14;
+  comp_sc_hpf_on     = slider15;
+  comp_sc_hpf_freq   = slider16;
+  stereo_link        = slider17;
+
+  comp_attack_coef = exp(-1 / (comp_attack_ms * 0.001 * srate));
+  comp_release_coef= exp(-1 / (comp_release_ms * 0.001 * srate));
+  comp_sc_coef     = exp(-2 * $pi * comp_sc_hpf_freq / srate);
+
+  // Tone parameters (sliders 18..21)
+  tone_enable = slider18;
+  tone_slope  = slider19;   // dB per dB of GR
+  tone_freq   = slider20;
+  tone_scale  = slider21;
+
+  // Output / limiter / parallel (sliders 22..24)
+  makeup_lin = exp(slider22 * ln10 / 20);
+  parallel_mix = slider23 / 100;
+  limiter_thresh_db = slider24;
+  limiter_thresh_lin = exp(limiter_thresh_db * ln10 / 20);
+
+  // Monitor mode (slider 25)
+  monitor_mode = slider25;
+
+  // Low cut filter (fixed)
+  low_cut_freq = 20;
+  lc_coef = exp(-2 * $pi * low_cut_freq / srate);
+
+@sample
+  inL = spl0;
+  inR = spl1;
+
+  // --- Gate Sidechain Filter (only if enabled) ---
+  gate_enable ? (
+    scL = inL; scR = inR;
+    scL = sc_lpL = sc_lpL * sc_lp_coef + scL * (1 - sc_lp_coef);
+    scR = sc_lpR = sc_lpR * sc_lp_coef + scR * (1 - sc_lp_coef);
+    sc_hpL = sc_hp_coef * (sc_hpL + scL - sc_prevL);
+    sc_hpR = sc_hp_coef * (sc_hpR + scR - sc_prevR);
+    sc_prevL = scL;
+    sc_prevR = scR;
+    scL = sc_hpL;
+    scR = sc_hpR;
+
+    // Gate Envelope
+    abs_scL = abs(scL); abs_scR = abs(scR);
+    gate_envL = abs_scL > gate_envL
+                ? gate_envL * gate_attack_coef + abs_scL * (1 - gate_attack_coef)
+                : gate_envL * gate_release_coef;
+    gate_envR = abs_scR > gate_envR
+                ? gate_envR * gate_attack_coef + abs_scR * (1 - gate_attack_coef)
+                : gate_envR * gate_release_coef;
+    gate_level_dbL = 20 * log(max(gate_envL, eps)) / ln10;
+    gate_level_dbR = 20 * log(max(gate_envR, eps)) / ln10;
+
+    gate_openL = gate_level_dbL > gate_thresh_db + gate_hyst_db ? 1 : (gate_level_dbL < gate_thresh_db ? 0 : gate_openL);
+    gate_openR = gate_level_dbR > gate_thresh_db + gate_hyst_db ? 1 : (gate_level_dbR < gate_thresh_db ? 0 : gate_openR);
+    gate_openL ? gate_timerL = gate_hold_samples : (gate_timerL > 0 ? gate_timerL -= 1 : 0);
+    gate_openR ? gate_timerR = gate_hold_samples : (gate_timerR > 0 ? gate_timerR -= 1 : 0);
+    gate_activeL = gate_openL || gate_timerL > 0;
+    gate_activeR = gate_openR || gate_timerR > 0;
+
+    gate_targetL = gate_activeL ? 1 : 0;
+    gate_targetR = gate_activeR ? 1 : 0;
+    gate_gainL = gate_targetL > gate_gainL
+                 ? gate_gainL * gate_attack_coef + gate_targetL * (1 - gate_attack_coef)
+                 : gate_gainL * gate_release_coef + gate_targetL * (1 - gate_release_coef);
+    gate_gainR = gate_targetR > gate_gainR
+                 ? gate_gainR * gate_attack_coef + gate_targetR * (1 - gate_attack_coef)
+                 : gate_gainR * gate_release_coef + gate_targetR * (1 - gate_release_coef);
+  ) : (
+    gate_gainL = gate_gainR = 1;  // bypass
+  );
+
+  // --- Low Cut (fixed HPF to remove DC) ---
+  hpL = lc_coef * (hp_prevL + inL - in_prevL);
+  hpR = lc_coef * (hp_prevR + inR - in_prevR);
+  in_prevL = inL; in_prevR = inR;
+  hp_prevL = hpL; hp_prevR = hpR;
+  procL = hpL;
+  procR = hpR;
+
+  // --- Apply Gate (if enabled) ---
+  gatedL = procL * gate_gainL;
+  gatedR = procR * gate_gainR;
+
+  // --- Compressor Sidechain HPF (if enabled) ---
+  comp_enable ? (
+    comp_sc_hpf_on ? (
+      comp_detL = comp_sc_coef * (comp_sc_hp_prevL + gatedL - comp_sc_in_prevL);
+      comp_detR = comp_sc_coef * (comp_sc_hp_prevR + gatedR - comp_sc_in_prevR);
+      comp_sc_in_prevL = gatedL; comp_sc_in_prevR = gatedR;
+      comp_sc_hp_prevL = comp_detL; comp_sc_hp_prevR = comp_detR;
+    ) : (
+      comp_detL = gatedL;
+      comp_detR = gatedR;
+    );
+
+    // Compressor Envelope
+    abs_detL = abs(comp_detL); abs_detR = abs(comp_detR);
+    comp_envL = abs_detL > comp_envL
+                ? comp_envL * comp_attack_coef + abs_detL * (1 - comp_attack_coef)
+                : comp_envL * comp_release_coef;
+    comp_envR = abs_detR > comp_envR
+                ? comp_envR * comp_attack_coef + abs_detR * (1 - comp_attack_coef)
+                : comp_envR * comp_release_coef;
+    comp_level_dbL = 20 * log(max(comp_envL, eps)) / ln10;
+    comp_level_dbR = 20 * log(max(comp_envR, eps)) / ln10;
+
+    gr_dbL = compute_gr(comp_level_dbL, comp_thresh_db, comp_knee_db, comp_ratio);
+    gr_dbR = compute_gr(comp_level_dbR, comp_thresh_db, comp_knee_db, comp_ratio);
+
+    stereo_link ? (
+      gr_db = max(gr_dbL, gr_dbR);
+      gr_dbL = gr_dbR = gr_db;
+    );
+
+    comp_gainL = exp(-gr_dbL * ln10 / 20);
+    comp_gainR = exp(-gr_dbR * ln10 / 20);
+  ) : (
+    comp_gainL = comp_gainR = 1;
+    gr_dbL = gr_dbR = 0;
+  );
+
+  compL = gatedL * comp_gainL;
+  compR = gatedR * comp_gainR;
+
+  // Delta signals for monitoring
+  gate_deltaL = procL - gatedL;
+  gate_deltaR = procR - gatedR;
+  comp_deltaL = gatedL - compL;   // before auto makeup
+  comp_deltaR = gatedR - compR;
+  // --- Auto Makeup (always on, compensates for gain reduction) ---
+  avg_gr = (gr_dbL + gr_dbR) * 0.5;
+  target_makeup = avg_gr * 0.5;   // compensate 50% of GR (adjustable?)
+  // Smooth with separate attack/release
+  target_makeup > auto_makeup ? coeff = 0.02 : coeff = 0.005;
+  auto_makeup += (target_makeup - auto_makeup) * coeff;
+  auto_makeup = max(0, min(auto_makeup, 12));
+  makeup_gain = exp(auto_makeup * ln10 / 20);
+  compL *= makeup_gain;
+  compR *= makeup_gain;
+
+  // --- Dynamic Tone (if enabled) ---
+  tone_enable ? (
+    avg_gr_dynamic = (gr_dbL + gr_dbR) * 0.5;
+    tone_env = tone_env * 0.995 + avg_gr_dynamic * 0.005;   // smoothed GR
+    shelf_db = tone_slope * tone_scale * tone_env;          // desired shelf gain in dB
+    // Apply reasonable caps
+    shelf_db = max(-10, min(5, shelf_db));
+
+    // Update biquad coefficients every 128 samples to save CPU
+    tone_update_counter += 1;
+    tone_update_counter >= 128 ? (
+      tone_update_counter = 0;
+      A = exp(shelf_db * ln10 / 40);   // convert dB to linear gain ratio
+      sqrtA = sqrt(A);
+      w0 = 2 * $pi * tone_freq / srate;
+      cosw0 = cos(w0);
+      sinw0 = sin(w0);
+      // High‑shelf filter (standard RBJ)
+     S = 1; // shelf slope parameter (1 is standard)
+     alpha = sinw0 * 0.5 * sqrt((A + 1/A)*(1/S - 1) + 2);
+      b0 =    A*((A+1) + (A-1)*cosw0 + 2*sqrtA*alpha);
+      b1 = -2*A*((A-1) + (A+1)*cosw0);
+      b2 =    A*((A+1) + (A-1)*cosw0 - 2*sqrtA*alpha);
+      a0 =        (A+1) - (A-1)*cosw0 + 2*sqrtA*alpha;
+      a1 =  2*((A-1) - (A+1)*cosw0);
+      a2 =        (A+1) - (A-1)*cosw0 - 2*sqrtA*alpha;
+      // Normalize
+      b0 /= a0; b1 /= a0; b2 /= a0;
+      a1 /= a0; a2 /= a0;
+    );
+
+    // Apply biquad
+    toneL = b0 * compL + tone_z1L;
+    tone_z1L = b1 * compL - a1 * toneL + tone_z2L;
+    tone_z2L = b2 * compL - a2 * toneL;
+
+    toneR = b0 * compR + tone_z1R;
+    tone_z1R = b1 * compR - a1 * toneR + tone_z2R;
+    tone_z2R = b2 * compR - a2 * toneR;
+  ) : (
+    toneL = compL;
+    toneR = compR;
+  );
+
+  // --- Parallel Mix ---
+  mixedL = procL * (1 - parallel_mix) + toneL * parallel_mix;
+  mixedR = procR * (1 - parallel_mix) + toneR * parallel_mix;
+
+  // --- Final Makeup & Limiter ---
+  outL = mixedL * makeup_lin;
+  outR = mixedR * makeup_lin;
+  // Simple cubic soft clipper starting at threshold
+  limiter_thresh_lin = exp(limiter_thresh_db * ln10 / 20);
+  // Map input to output: for |x| < thresh, linear; for above, soft clip
+  // Using a polynomial clipper for simplicity
+  outL = outL - (outL*outL*outL) * 0.3333333 * (abs(outL) > limiter_thresh_lin ? 1 : 0);
+  outR = outR - (outR*outR*outR) * 0.3333333 * (abs(outR) > limiter_thresh_lin ? 1 : 0);
+
+  // --- Monitor Modes ---
+  monitor_mode == 1 ? ( // Gate Sidechain
+    spl0 = scL;
+    spl1 = scR;
+  ) : monitor_mode == 2 ? ( // Gate Delta (amount removed by gate)
+    spl0 = gate_deltaL;
+    spl1 = gate_deltaR;
+  ) : monitor_mode == 3 ? ( // Compressor Sidechain (detector signal)
+    // Use a safe fallback if compressor is off
+    comp_enable ? (
+      spl0 = comp_detL;
+      spl1 = comp_detR;
+    ) : (
+      spl0 = gatedL;
+      spl1 = gatedR;
+    );
+  ) : monitor_mode == 4 ? ( // Compressor Delta (amount removed by comp)
+    spl0 = comp_deltaL;
+    spl1 = comp_deltaR;
+  ) : ( // Normal output
+    spl0 = outL;
+    spl1 = outR;
+  );
+
+  // --- Meters ---
+  gate_gr_db = -20 * log10(max(gate_gainL, eps));
+  gate_meter = max(gate_meter * 0.99, gate_gr_db / 30);
+  comp_meter = max(comp_meter * 0.99, gr_dbL / 30);
+  tone_meter = tone_meter * 0.99 + shelf_db * 0.01;   // smoothed for display
+
+@gfx 300 180
+  gfx_r = 0.2; gfx_g = 0.2; gfx_b = 0.2; gfx_a = 1;
+  gfx_rect(0, 0, gfx_w, gfx_h);
+
+  // Simple horizontal meters
+  bar_x = 60;
+  bar_y = 30;
+  bar_w = gfx_w - 80;
+  bar_h = 20;
+  gap = 30;
+
+  // Gate
+  gfx_r = 0.9; gfx_g = 0.6; gfx_b = 0.1;
+  gate_w = gate_meter * bar_w;
+  gfx_rect(bar_x, bar_y, gate_w, bar_h);
+  gfx_r = 1; gfx_g = 1; gfx_b = 1;
+  gfx_x = 10; gfx_y = bar_y + 5;
+  gfx_drawstr("Gate");
+  gfx_x = bar_x + bar_w + 5; gfx_y = bar_y + 5;
+  gfx_drawnumber(gate_gr_db, 1); gfx_drawstr("dB");
+
+  // Comp
+  gfx_r = 0.9; gfx_g = 0.2; gfx_b = 0.2;
+  comp_w = comp_meter * bar_w;
+  gfx_rect(bar_x, bar_y + gap, comp_w, bar_h);
+  gfx_r = 1; gfx_g = 1; gfx_b = 1;
+  gfx_x = 10; gfx_y = bar_y + gap + 5;
+  gfx_drawstr("Comp");
+  gfx_x = bar_x + bar_w + 5; gfx_y = bar_y + gap + 5;
+  gfx_drawnumber(gr_dbL, 1); gfx_drawstr("dB");
+
+  // Tone
+  gfx_r = 0.2; gfx_g = 0.8; gfx_b = 0.2;
+  tone_norm = (tone_meter + 10) / 15;
+  tone_norm = max(0, min(1, tone_norm));
+  tone_w = tone_norm * bar_w;
+  gfx_rect(bar_x, bar_y + 2*gap, tone_w, bar_h);
+  gfx_r = 1; gfx_g = 1; gfx_b = 1;
+  gfx_x = 10; gfx_y = bar_y + 2*gap + 5;
+  gfx_drawstr("Tone");
+  gfx_x = bar_x + bar_w + 5; gfx_y = bar_y + 2*gap + 5;
+  gfx_drawnumber(tone_meter, 1); gfx_drawstr("dB");

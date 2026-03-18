@@ -1,0 +1,250 @@
+/*
+  desc: Gain Rider + Distance EQ (Final)
+  author: Res / DeepSeek
+  - Spatial Separation effect meant to complement trackspacers like ANINA/MixSpace/Gimme Space
+  - 
+  - Dynamically balances secondary track relative to primary using offset
+  - Only attenuates (never boosts)
+  - Distance EQ blends a filtered version based on gain reduction (curved, 2‑pole, true shelf)
+*/
+
+desc: BUM: The Stalker by Res
+slider1:300<20,20000,1>Sidechain HPF (Hz)
+slider2:5000<100,20000,1>Sidechain LPF (Hz)
+slider3:-40<-80,0,0.1>Activation Threshold (dB)
+slider4:0<-12,12,0.1>Offset (dB)
+slider5:24<0,40,0.1>Max Reduction (dB)
+slider6:50<10,500,1>Attack (ms)
+slider7:200<50,1000,1>Release (ms)
+slider8:0<0,20,0.1>Lookahead (ms)
+slider9:0<0,1,1{Off,On}>Monitor Sidechain
+slider10:0<0,1,1{Off,On}>Distance EQ
+slider11:0<0,1,1{Low Pass,High Shelf}>EQ Type
+slider12:4000<500,10000,1>EQ Freq (Hz)
+slider13:50<0,100,1>EQ Depth (%)
+
+@init
+  eps = 0.000000001;
+  ln10 = log(10);
+
+  // Filter states for sidechain
+  sc_lpL = sc_lpR = 0;
+  sc_hp_prevL = sc_hp_prevR = 0;
+
+  // RMS detectors (200 ms)
+  rms_coef = exp(-1 / (0.2 * srate));
+  pri_rms_sq = 0;
+  sec_rms_sq = 0;
+
+  // Gain smoothing
+  gr_smooth = 0;
+  current_gr_db = 0;
+
+  // Lookahead buffer
+  bufL = 0; bufR = 0; buf_pos = 0;
+
+  // Distance EQ filter states (2‑pole)
+  eq_lp1L = eq_lp1R = 0;
+  eq_lp2L = eq_lp2R = 0;
+
+  // Metering
+  in_meter = 0;
+  sc_meter = 0;
+  out_meter = 0;
+    wet_sm = 0; // for smoothing EQ depth
+
+@slider
+  // Sidechain filters
+  lpf_freq = slider2;
+  hpf_freq = slider1;
+  lpf_coef = exp(-2 * $pi * lpf_freq / srate);
+  hpf_coef = exp(-2 * $pi * hpf_freq / srate);
+
+  // Main parameters
+  thresh_db = slider3;
+  offset_db = slider4;
+  max_red_db = slider5;
+  attack_ms = slider6;
+  release_ms = slider7;
+  lookahead_ms = slider8;
+  monitor = slider9;
+
+  // Distance EQ
+  eq_enable = slider10;
+  eq_type = slider11;
+  eq_freq = slider12;
+  eq_depth = slider13 / 100;
+  eq_coef = exp(-2 * $pi * eq_freq / srate);
+
+  // Envelope coefficients
+  attack_coef = exp(-1 / (attack_ms * 0.001 * srate));
+  release_coef = exp(-1 / (release_ms * 0.001 * srate));
+
+  // Lookahead buffer (max 50 ms)
+  max_lookahead_ms = 50;
+  max_lookahead_samples = floor(max_lookahead_ms * 0.001 * srate) + 1;
+  lookahead_samples = min(floor(lookahead_ms * 0.001 * srate), max_lookahead_samples - 1);
+
+  bufL = max_lookahead_samples;
+  bufR = max_lookahead_samples;
+  memset(bufL, 0, max_lookahead_samples);
+  memset(bufR, 0, max_lookahead_samples);
+  buf_pos = 0;
+
+@sample
+  // --- Sidechain Input (primary) ---
+  sc_rawL = spl2;
+  sc_rawR = spl3;
+
+  // Bandpass: lowpass then highpass
+  scL = sc_lpL = sc_lpL * lpf_coef + sc_rawL * (1 - lpf_coef);
+  scR = sc_lpR = sc_lpR * lpf_coef + sc_rawR * (1 - lpf_coef);
+  sc_hpL = hpf_coef * (scL - sc_hp_prevL) + sc_hp_prevL;
+  sc_hp_prevL = scL;
+  sc_hpR = hpf_coef * (scR - sc_hp_prevR) + sc_hp_prevR;
+  sc_hp_prevR = scR;
+  sc_filteredL = sc_hpL;
+  sc_filteredR = sc_hpR;
+
+  // --- Primary RMS ---
+  pri_abs = max(abs(sc_filteredL), abs(sc_filteredR));
+  pri_rms_sq = pri_rms_sq * rms_coef + pri_abs*pri_abs * (1 - rms_coef);
+  pri_rms = sqrt(pri_rms_sq);
+  pri_db = 20 * log(max(pri_rms, eps)) / ln10;
+
+  // --- Secondary input RMS ---
+  inL = spl0;
+  inR = spl1;
+  sec_abs = max(abs(inL), abs(inR));
+  sec_rms_sq = sec_rms_sq * rms_coef + sec_abs*sec_abs * (1 - rms_coef);
+  sec_rms = sqrt(sec_rms_sq);
+  sec_db = 20 * log(max(sec_rms, eps)) / ln10;
+
+  // --- Meters (smoothed) ---
+  in_meter = in_meter * 0.999 + sec_abs * 0.001;
+  sc_meter = sc_meter * 0.999 + (pri_abs * 10) * 0.001;
+
+  monitor ? (
+    // Monitor filtered sidechain
+    spl0 = sc_filteredL;
+    spl1 = sc_filteredR;
+    out_meter = sc_meter;
+  ) : (
+    // --- Gain computer ---
+    pri_db > thresh_db ? (
+      desired_sec_db = pri_db + offset_db;
+      sec_db > desired_sec_db ? (
+        reduction_db = min(max_red_db, sec_db - desired_sec_db);
+        target_gain = exp(-reduction_db * ln10 / 20);
+        current_gr_db = reduction_db;
+      ) : (
+        target_gain = 1.0;
+        current_gr_db = 0;
+      ); 
+    ) : (
+      target_gain = 1.0;
+      current_gr_db = 0;
+    );
+
+    // Smooth gain
+    gr_smooth = target_gain > gr_smooth
+                ? gr_smooth * attack_coef + target_gain * (1 - attack_coef)
+                : gr_smooth * release_coef + target_gain * (1 - release_coef);
+
+    // Lookahead
+    lookahead_samples > 0 ? (
+      bufL[buf_pos] = inL;
+      bufR[buf_pos] = inR;
+      read_pos = (buf_pos - lookahead_samples + max_lookahead_samples) % max_lookahead_samples;
+      procL = bufL[read_pos];
+      procR = bufR[read_pos];
+      buf_pos = (buf_pos + 1) % max_lookahead_samples;
+    ) : (
+      procL = inL;
+      procR = inR;
+    );
+
+    // Apply gain
+    outL = procL * gr_smooth;
+    outR = procR * gr_smooth;
+
+  // --- Distance EQ (dynamic) ---
+  eq_enable ? (
+    gr_db = current_gr_db;
+    // Only apply if reduction is noticeable (avoid tiny modulations)
+    gr_db > 1 ? (
+      norm = gr_db / max_red_db;
+      norm = max(0, min(1, norm));
+      // Curved response: more EQ at low GR
+      wet = pow(norm, 0.6) * eq_depth;
+      wet = max(0, min(1, wet));
+  
+      // Optional: smooth wet to avoid tone flutter
+      wet_sm = wet_sm * 0.99 + wet * 0.01;
+      wet_use = wet_sm; // use smoothed value
+  
+      // Optional: HF floor – never completely muffle
+      wet_use = min(wet_use, 0.85);
+  
+      // Compute 2‑pole lowpass (used by both modes)
+      eq_lp1L = eq_lp1L * eq_coef + outL * (1 - eq_coef);
+      eq_lp1R = eq_lp1R * eq_coef + outR * (1 - eq_coef);
+      eq_lp2L = eq_lp2L * eq_coef + eq_lp1L * (1 - eq_coef);
+      eq_lp2R = eq_lp2R * eq_coef + eq_lp1R * (1 - eq_coef);
+  
+      eq_type == 0 ? ( // Low Pass: blend lowpassed with wet
+        outL = outL * (1 - wet_use) + eq_lp2L * wet_use;
+        outR = outR * (1 - wet_use) + eq_lp2R * wet_use;
+      ) : ( // High Shelf: reduce only highs
+        highL = outL - eq_lp2L;
+        highR = outR - eq_lp2R;
+        outL = eq_lp2L + highL * (1 - wet_use);
+        outR = eq_lp2R + highR * (1 - wet_use);
+      );
+    ); // gr_db > 1
+  ); // eq_enable
+
+    spl0 = outL;
+    spl1 = outR;
+
+    // Output meter
+    out_abs = max(abs(outL), abs(outR));
+    out_meter = out_meter * 0.999 + out_abs * 0.001;
+  );
+
+@gfx 300 200
+  // Background
+  gfx_r = 0.2; gfx_g = 0.2; gfx_b = 0.2; gfx_a = 1;
+  gfx_rect(0, 0, gfx_w, gfx_h);
+
+  gfx_r = 1; gfx_g = 1; gfx_b = 1;
+  gfx_x = 10; gfx_y = 10; gfx_drawstr("Gain Rider + Distance");
+
+  gfx_x = 230; gfx_y = 10;
+  monitor ? ( gfx_r = 1; gfx_g = 0.5; gfx_b = 0; gfx_drawstr("MONITOR ON"); )
+         : ( gfx_r = 0.3; gfx_g = 0.8; gfx_b = 0.3; gfx_drawstr("Monitor Off"); );
+
+  // Meter backgrounds
+  gfx_r = 0.1; gfx_g = 0.1; gfx_b = 0.1;
+  gfx_rect(90, 30, 150, 15);
+  gfx_rect(90, 70, 150, 15);
+  gfx_rect(90, 110, 150, 15);
+
+  // Input meter
+  gfx_r = 0.2; gfx_g = 0.6; gfx_b = 0.8;
+  in_width = min(150, in_meter * 150 * 2);
+  gfx_rect(90, 30, in_width, 15);
+  gfx_r = 1; gfx_g = 1; gfx_b = 1;
+  gfx_x = 37; gfx_y = 33; gfx_drawstr("Input");
+
+  // Sidechain meter
+  gfx_r = 0.2; gfx_g = 0.8; gfx_b = 0.2;
+  sc_width = min(150, sc_meter * 150 * 2);
+  gfx_rect(90, 70, sc_width, 15);
+  gfx_x = 21; gfx_y = 73; gfx_drawstr("Primary");
+
+  // Output meter
+  gfx_r = 0.9; gfx_g = 0.2; gfx_b = 0.2;
+  out_width = min(150, out_meter * 150 * 2);
+  gfx_rect(90, 110, out_width, 15);
+  gfx_x = 30; gfx_y = 113; gfx_drawstr("Output");

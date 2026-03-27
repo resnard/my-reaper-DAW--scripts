@@ -1,14 +1,18 @@
 -- @description ReaFX Folder
--- @version 1.6
--- @author Resnard Lapiz (with assistance)
--- @about Two‑column browser for custom FX folders with per‑plugin notes, tags, and intelligent pin routing.
---   Parses reaper-fxfolders.ini directly. Features: stay‑open toggle, shift+enter bypass,
+-- @version 1.9
+-- @author Resnard Lapiz (refactored with assistance)
+-- @about Two-column browser for custom FX folders with per-plugin notes, tags, and intelligent pin routing.
+--   New: temporary FX chain builder (Column 1) with reordering, independent pin configs, save to file.
+--   Parses reaper-fxfolders.ini directly. Features: stay-open toggle, shift+enter bypass,
 --   dynamic unused pair detection for SC modes, column sorting, tag filtering.
 -- @noindex
 
+
 local r = reaper
 
--- --- Dependency check ---
+-- ======================================================================
+-- Dependency check
+-- ======================================================================
 if not r.ImGui_CreateContext then
     r.ShowMessageBox("ReaImGui not found. Please install cfillion's ReaImGui.", "Missing dependency", 0)
     return
@@ -20,10 +24,12 @@ if not ctx then
     return
 end
 
--- --- Paths ---
+-- ======================================================================
+-- Paths / storage
+-- ======================================================================
 local script_path = debug.getinfo(1, "S").source:match("^@?(.*[\\/])") or ""
 local resource_path = r.GetResourcePath()
-local sep = package.config:sub(1,1)
+local sep = package.config:sub(1, 1)
 
 local data_dir = script_path .. "ReaFX_Folder_Data"
 r.RecursiveCreateDirectory(data_dir, 0)
@@ -32,37 +38,202 @@ local SETTINGS_FILE = data_dir .. sep .. "settings.lua"
 local NOTES_TAGS_FILE = data_dir .. sep .. "notes_tags.lua"
 local FXFOLDERS_INI = resource_path .. sep .. "reaper-fxfolders.ini"
 
--- ----------------------------------------------------------------------
--- Smart folder parser (adapted from Sexan)
--- ----------------------------------------------------------------------
+-- ======================================================================
+-- Small utilities
+-- ======================================================================
+local function clamp_channel(val)
+    val = tonumber(val) or 1
+    if val < 1 then return 1 end
+    if val > 64 then return 64 end
+    return val
+end
+
+local function plain_find(haystack, needle)
+    if needle == "" then return true end
+    if not haystack or not needle then return false end
+    return haystack:find(needle, 1, true) ~= nil
+end
+
+local function pair_text(a, b) return string.format("%d/%d", a or 0, b or 0) end
+
+local function split_csv(text)
+    local out = {}
+    text = text or ""
+    for token in text:gmatch("[^,]+") do
+        token = token:match("^%s*(.-)%s*$")
+        if token ~= "" then out[#out + 1] = token end
+    end
+    return out
+end
+
+
+local function is_array(tbl)
+    if type(tbl) ~= "table" then return false, 0 end
+    local n = 0
+    for k, _ in pairs(tbl) do
+        if type(k) ~= "number" or k < 1 or k % 1 ~= 0 then return false, 0 end
+        n = n + 1
+    end
+    for i = 1, n do if rawget(tbl, i) == nil then return false, 0 end end
+    return true, n
+end
+
+local function sorted_keys(tbl)
+    local keys = {}
+    for k in pairs(tbl) do keys[#keys + 1] = k end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    return keys
+end
+
+local function serialize_value(v, indent)
+    local t = type(v)
+    if t == "table" then
+        local array, n = is_array(v)
+        local pad = string.rep(" ", indent)
+        local child_pad = string.rep(" ", indent + 2)
+        if array then
+            local items = {}
+            for i = 1, n do items[#items + 1] = child_pad .. serialize_value(v[i], indent + 2) end
+            return "{\n" .. table.concat(items, ",\n") .. "\n" .. pad .. "}"
+        end
+        local items = {}
+        for _, k in ipairs(sorted_keys(v)) do
+            local key_repr
+            if type(k) == "string" and k:match("^[%a_][%w_]*$") then
+                key_repr = k
+            else
+                key_repr = "[" .. string.format("%q", k) .. "]"
+            end
+            items[#items + 1] = child_pad .. key_repr .. " = " .. serialize_value(v[k], indent + 2)
+        end
+        return "{\n" .. table.concat(items, ",\n") .. "\n" .. pad .. "}"
+    elseif t == "string" then
+        return string.format("%q", v)
+    else
+        return tostring(v)
+    end
+end
+
+local function serialize(tbl) return serialize_value(tbl, 0) end
+
+local function load_table(path, default)
+    local f = io.open(path, "r")
+    if not f then return default or {} end
+    local content = f:read("*a")
+    f:close()
+    local fn = load("return " .. content, "load_table", "t", {})
+    if not fn then return default or {} end
+    local ok, res = pcall(fn)
+    if not ok or type(res) ~= "table" then return default or {} end
+    return res
+end
+
+local function save_table(path, tbl)
+    local f = io.open(path, "w")
+    if not f then return false end
+    f:write(serialize(tbl))
+    f:close()
+    return true
+end
+
+
+local function set_style_button_transparent()
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), 0x00000000)
+end
+
+-- ======================================================================
+-- Pin mode definitions
+-- ======================================================================
+local MODE_NAMES = {
+    "Default", "SC→SC", "In→SC", "SC→Out", "In→Left", "In→Right",
+    "SC→Left", "SC→Right", "Left→Out", "Right→Out", "Left→SC", "Right→SC", "Custom"
+}
+
+local MODE_PRESETS = {
+    ["Default"]   = { inL = 1, inR = 2, outL = 1, outR = 2 },
+    ["SC→SC"]     = { inL = 3, inR = 4, outL = 3, outR = 4 },
+    ["In→SC"]     = { inL = 1, inR = 2, outL = 3, outR = 4 },
+    ["SC→Out"]    = { inL = 3, inR = 4, outL = 1, outR = 2 },
+    ["In→Left"]   = { inL = 1, inR = 2, outL = 1, outR = 1 },
+    ["In→Right"]  = { inL = 1, inR = 2, outL = 2, outR = 2 },
+    ["SC→Left"]   = { inL = 3, inR = 4, outL = 1, outR = 1 },
+    ["SC→Right"]  = { inL = 3, inR = 4, outL = 2, outR = 2 },
+    ["Left→Out"]  = { inL = 1, inR = 1, outL = 1, outR = 2 },
+    ["Right→Out"] = { inL = 2, inR = 2, outL = 1, outR = 2 },
+    ["Left→SC"]   = { inL = 1, inR = 1, outL = 3, outR = 4 },
+    ["Right→SC"]  = { inL = 2, inR = 2, outL = 3, outR = 4 },
+}
+
+local MODE_DESCRIPTIONS = {
+    ["Default"]   = "Default: Input and output both use channels 1/2.",
+    ["SC→SC"]     = "SC→SC: Input and output both use the same unused stereo pair (auto).",
+    ["In→SC"]     = "In→SC: Input uses 1/2, output uses an unused stereo pair (auto).",
+    ["SC→Out"]    = "SC→Out: Input uses an unused stereo pair (auto), output uses 1/2.",
+    ["In→Left"]   = "In→Left: Input uses 1/2, output sends left only to channel 1.",
+    ["In→Right"]  = "In→Right: Input uses 1/2, output sends right only to channel 2.",
+    ["SC→Left"]   = "SC→Left: Input uses an unused stereo pair (auto), output sends left only to channel 1.",
+    ["SC→Right"]  = "SC→Right: Input uses an unused stereo pair (auto), output sends right only to channel 2.",
+    ["Left→Out"]  = "Left→Out: Input takes left only from channel 1, output sends to 1/2.",
+    ["Right→Out"] = "Right→Out: Input takes right only from channel 2, output sends to 1/2.",
+    ["Left→SC"]   = "Left→SC: Input takes left only from channel 1, output uses an unused stereo pair (auto).",
+    ["Right→SC"]  = "Right→SC: Input takes right only from channel 2, output uses an unused stereo pair (auto).",
+    ["Custom"]    = "Custom: Manually set all four track channels.",
+}
+
+local function get_mode_preset(mode)
+    local p = MODE_PRESETS[mode]
+    if not p then return { inL = 1, inR = 2, outL = 1, outR = 2 } end
+    return { inL = p.inL, inR = p.inR, outL = p.outL, outR = p.outR }
+end
+
+local function get_mode_description(mode) return MODE_DESCRIPTIONS[mode] or "" end
+
+local function get_global_pin_text(mode, p)
+    p = p or get_mode_preset(mode)
+    if mode == "SC→SC" then
+        return "auto", "auto"
+    elseif mode == "In→SC" then
+        return pair_text(p.inL, p.inR), "auto"
+    elseif mode == "SC→Out" then
+        return "auto", pair_text(p.outL, p.outR)
+    elseif mode == "SC→Left" or mode == "SC→Right" then
+        return "auto", pair_text(p.outL, p.outR)
+    elseif mode == "Left→SC" or mode == "Right→SC" then
+        return pair_text(p.inL, p.inR), "auto"
+    elseif mode == "Default" or mode == "In→Left" or mode == "In→Right" or mode == "Left→Out" or mode == "Right→Out" or mode == "Custom" then
+        return pair_text(p.inL, p.inR), pair_text(p.outL, p.outR)
+    end
+    return "?", "?"
+end
+
+-- ======================================================================
+-- Smart folder parsing (unchanged)
+-- ======================================================================
 local function parse_fx_folders()
-    -- Build plugin list
-    local PLUGIN_LIST = {}
+    local plugin_list = {}
     local idx = 0
     while true do
         local ok, name = r.EnumInstalledFX(idx)
         if not ok then break end
-        PLUGIN_LIST[#PLUGIN_LIST+1] = name
+        plugin_list[#plugin_list + 1] = name
         idx = idx + 1
     end
-    PLUGIN_LIST[#PLUGIN_LIST+1] = "Container"
-    PLUGIN_LIST[#PLUGIN_LIST+1] = "Video processor"
+    plugin_list[#plugin_list + 1] = "Container"
+    plugin_list[#plugin_list + 1] = "Video processor"
 
     local magic = {
-        ["not"] = { ' and ', ' not %s:find("%s") ' },
-        ["or"] = { ' or ', ' %s:find("%s") ' },
-        ["and"] = { ' and ', '%s:find("%s") ' },
+        ["not"] = { " and ", " not %s:find(%q, 1, true) " },
+        ["or"]  = { " or ", " %s:find(%q, 1, true) " },
+        ["and"] = { " and ", "%s:find(%q, 1, true) " },
     }
-
     local function parse_smart_folder(smart_string)
         local smart_terms = {}
-        local SMART_FX = {}
-
+        local smart_fx = {}
+        -- Replace quoted phrases with a placeholder that preserves spaces
         for exact in smart_string:gmatch('"(.-)"') do
             smart_string = smart_string:gsub(exact, '_schwa_magic_' .. exact:gsub(' ', '|||'))
         end
         smart_string = smart_string:gsub('"', '')
-
         for term in smart_string:gmatch("([^%s]+)") do
             term = term:lower():gsub('[%(%)%.%+%-%*%?%[%]%^%$%%]', '%%%1')
             if term:find('_schwa_magic_') then
@@ -73,10 +244,9 @@ local function parse_fx_folders()
                     term = '%A' .. term .. '%A'
                 end
             end
-            smart_terms[#smart_terms+1] = term
+            smart_terms[#smart_terms + 1] = term
         end
-
-        local code_gen = { "for i = 1, #PLUGIN_LIST do\nlocal target = PLUGIN_LIST[i]:lower()", "" }
+        local code_gen = { "for i = 1, #plugin_list do\nlocal target = plugin_list[i]:lower()", "" }
         local add_magic
         for i = 1, #smart_terms do
             if magic[smart_terms[i]] then
@@ -86,205 +256,195 @@ local function parse_fx_folders()
                     code_gen[2] = code_gen[2] .. add_magic:format("target", smart_terms[i])
                     add_magic = nil
                 else
-                    code_gen[2] = i > 1 and code_gen[2] .. " and " .. (' %s:find("%s")'):format("target", smart_terms[i]) or
-                        code_gen[2] .. (' %s:find("%s")'):format("target", smart_terms[i])
+                    code_gen[2] = i > 1 and code_gen[2] .. " and " .. ('%s:find(%q, 1, true)'):format("target", smart_terms[i]) or
+                        code_gen[2] .. ('%s:find(%q, 1, true)'):format("target", smart_terms[i])
                 end
             end
         end
         code_gen[2] = 'if ' .. code_gen[2] .. ' then'
-        code_gen[#code_gen+1] = 'SMART_FX[#SMART_FX+1] = PLUGIN_LIST[i]\nend\nend\n'
-
+        code_gen[#code_gen + 1] = 'smart_fx[#smart_fx+1] = plugin_list[i]\nend\nend\n'
         local code_str = table.concat(code_gen, "\n")
-        local func_env = { SMART_FX = SMART_FX, PLUGIN_LIST = PLUGIN_LIST, string = string }
-        local func, err = load(code_str, "SmartFolder", "t", func_env)
-        if func then
-            pcall(func)
-        end
-        return SMART_FX
+        local func_env = { smart_fx = smart_fx, plugin_list = plugin_list, string = string }
+        local func = load(code_str, "SmartFolder", "t", func_env)
+        if func then pcall(func) end
+        return smart_fx
     end
 
     -- Parse reaper-fxfolders.ini
-    local f = io.open(FXFOLDERS_INI, "r")
-    if not f then return {} end
-
-    local folders_by_idx = {}
-    local folder_names = {}
-    local folder_order = {}
-    local current_folder_idx = nil
-
-    for line in f:lines() do
-        line = line:gsub("%s+$", "")
-        if line:match("^%[") then
-            local section = line:match("^%[(.-)%]$")
-            if section:match("^Folder(%d+)$") then
-                current_folder_idx = section:match("^Folder(%d+)$")
-                folders_by_idx[current_folder_idx] = { query = nil, type = nil }
-            elseif section == "Folders" then
-                current_folder_idx = nil
-            else
-                current_folder_idx = nil
-            end
-        elseif current_folder_idx then
-            local key, val = line:match("^(.-)=(.*)$")
-            if key then
-                if key == "Item0" then
-                    folders_by_idx[current_folder_idx].query = val
-                elseif key == "Type0" then
-                    folders_by_idx[current_folder_idx].type = tonumber(val)
-                end
-            end
-        elseif line:match("^Name(%d+)=(.*)$") then
-            local id_str, name = line:match("^Name(%d+)=(.*)$")
-            folder_names[id_str] = name
-            table.insert(folder_order, id_str)
-        end
-    end
-    f:close()
+   local f = io.open(FXFOLDERS_INI, "r")
+   if not f then return {} end
+   
+   local folders_by_idx = {}        -- folder index -> { name, parent_guid, items = {} }
+   local folder_names = {}
+   local folder_order = {}
+   local current_folder_idx = nil
+   -- Temporary storage for items per folder while parsing
+   local temp_items = {}  -- folder_idx -> table keyed by item number
+   
+   for line in f:lines() do
+       line = line:gsub("%s+$", "")
+       if line:match("^%[") then
+           local section = line:match("^%[(.-)%]$")
+           if section and section:match("^Folder(%d+)$") then
+               current_folder_idx = section:match("^Folder(%d+)$")
+               folders_by_idx[current_folder_idx] = folders_by_idx[current_folder_idx] or { items = {} }
+               temp_items[current_folder_idx] = temp_items[current_folder_idx] or {}
+           elseif section == "Folders" then
+               current_folder_idx = nil
+           else
+               current_folder_idx = nil
+           end
+       elseif current_folder_idx then
+           local key, val = line:match("^(.-)=(.*)$")
+           if key then
+               if key:match("^Item%d+$") then
+                   local idx = tonumber(key:match("^Item(%d+)$"))
+                   if idx then
+                       temp_items[current_folder_idx][idx] = temp_items[current_folder_idx][idx] or {}
+                       temp_items[current_folder_idx][idx].query = val
+                   end
+               elseif key:match("^Type%d+$") then
+                   local idx = tonumber(key:match("^Type(%d+)$"))
+                   if idx then
+                       temp_items[current_folder_idx][idx] = temp_items[current_folder_idx][idx] or {}
+                       temp_items[current_folder_idx][idx].type = tonumber(val)
+                   end
+               elseif key == "name" then
+                   -- This might appear if we had a name field inside folder? Actually names are in [Folders] section.
+                   -- We'll ignore.
+               elseif key == "parent" then
+                   folders_by_idx[current_folder_idx].parent_guid = val
+               end
+           end
+       else
+           local id_str, name = line:match("^Name(%d+)=(.*)$")
+           if id_str then
+               folder_names[id_str] = name
+               folder_order[#folder_order + 1] = id_str
+               -- Also store name in folders_by_idx for later
+               folders_by_idx[id_str] = folders_by_idx[id_str] or { items = {} }
+               folders_by_idx[id_str].name = name
+           end
+       end
+   end
+   
+   -- Convert temp_items to ordered lists in folders_by_idx
+   for idx, items_tbl in pairs(temp_items) do
+       local items_list = {}
+       -- Get sorted indices
+       local indices = {}
+       for k in pairs(items_tbl) do indices[#indices+1] = k end
+       table.sort(indices)
+       for _, i in ipairs(indices) do
+           items_list[#items_list+1] = {
+               query = items_tbl[i].query,
+               type = items_tbl[i].type
+           }
+       end
+       folders_by_idx[idx].items = items_list
+   end
+   
+   f:close()
 
     local folder_tree = {}
-    for _, id_str in ipairs(folder_order) do
-        local name = folder_names[id_str]
-        local data = folders_by_idx[id_str]
-        if data and data.query then
-            local plugin_names = {}
-            if data.type == 1048576 then
-                plugin_names = parse_smart_folder(data.query)
-            else
-                plugin_names = { data.query:gsub('"', '') }
-            end
-
-            local plugins_with_meta = {}
-            for _, pname in ipairs(plugin_names) do
-                local ptype = "Unknown"
-                if pname:match("^VST3:") then ptype = "VST3"
-                elseif pname:match("^VST:") then ptype = "VST2"
-                elseif pname:match("^VSTi:") then ptype = "VSTi"
-                elseif pname:match("^JS:") then ptype = "JS"
-                elseif pname:match("^CLAP") then ptype = "CLAP"
-                elseif pname:match("^AU") then ptype = "AU"
-                elseif pname:match("^LV2") then ptype = "LV2"
-                end
-
-                local developer = "Unknown"
-                local dev_match = pname:match("%((.-)%)$")
-                if dev_match then developer = dev_match end
-
-                table.insert(plugins_with_meta, {
-                    name = pname,
-                    type = ptype,
-                    developer = developer
-                })
-            end
-
-            table.sort(plugins_with_meta, function(a, b) return a.name:lower() < b.name:lower() end)
-
-            table.insert(folder_tree, {
-                guid = id_str,
-                name = name,
-                plugins = plugins_with_meta
-            })
-        end
-    end
-
+    
+  for _, id_str in ipairs(folder_order) do
+      local name = folder_names[id_str]
+      local data = folders_by_idx[id_str]
+      if data and data.items and #data.items > 0 then
+          local all_plugins_with_meta = {}
+          for _, item in ipairs(data.items) do
+              local item_query = item.query
+              local item_type = item.type
+              local plugin_names
+              if item_type == 1048576 then
+                  plugin_names = parse_smart_folder(item_query)
+              elseif item_type == 1000 then
+                  plugin_names = { "CHAIN: " .. item_query:gsub('"', '') }
+              else
+                  plugin_names = { item_query:gsub('"', '') }
+              end
+  
+              for _, pname in ipairs(plugin_names) do
+                  -- same metadata extraction as before
+                  -- but we need to avoid duplicates if same plugin appears multiple times? Probably not.
+           local ptype = "Unknown"
+           if pname:match("^VST3:") then ptype = "VST3"
+           elseif pname:match("^VST:") then ptype = "VST2"
+           elseif pname:match("^VSTi:") then ptype = "VSTi"
+           elseif pname:match("^JS:") then ptype = "JS"
+           elseif pname:match("^CLAP") then ptype = "CLAP"
+           elseif pname:match("^AU") then ptype = "AU"
+           elseif pname:match("^LV2") then ptype = "LV2" end
+           local developer = "Unknown"
+           local dev_match = pname:match("%(([^()]*)%)$")
+           if dev_match then developer = dev_match:match("^%s*(.-)%s*$") end
+                  -- ... (developer extraction)
+                  local is_fxchain = false
+                  local chain_path = nil
+                  if item_type == 1000 then
+                      is_fxchain = true
+                      local base = pname:gsub("^CHAIN: ", "")
+                     chain_path = resource_path .. sep .. "FXChains" .. sep .. base .. ".RfxChain"
+                      ptype = "CHAIN"
+                      developer = "FX Chain"
+                  end
+                  table.insert(all_plugins_with_meta, {
+                      name = pname,
+                      type = ptype,
+                      developer = developer,
+                      is_fxchain = is_fxchain,
+                      chain_path = chain_path,
+                  })
+              end
+          end
+          -- Sort and add to folder_tree
+          table.sort(all_plugins_with_meta, function(a, b) return a.name:lower() < b.name:lower() end)
+          table.insert(folder_tree, {
+              guid = id_str,
+              name = name,
+              plugins = all_plugins_with_meta,
+          })
+      end
+  end
     table.sort(folder_tree, function(a, b) return a.name:lower() < b.name:lower() end)
     return folder_tree
 end
 
--- ----------------------------------------------------------------------
--- Persistence helpers
--- ----------------------------------------------------------------------
-local function serialize(val, indent)
-    indent = indent or 0
-    local pad = string.rep(" ", indent)
-    local function serialize_value(v, lvl)
-        local t = type(v)
-        if t == "table" then
-            local lines = {}
-            for k, v2 in pairs(v) do
-                local k_str
-                if type(k) == "number" then
-                    k_str = "[" .. k .. "]"
-                elseif type(k) == "string" and k:match("^[%a_][%w_]*$") then
-                    k_str = k
-                else
-                    k_str = "[" .. string.format("%q", k) .. "]"
-                end
-                lines[#lines+1] = string.rep(" ", lvl+2) .. k_str .. " = " .. serialize_value(v2, lvl+2)
-            end
-            return "{\n" .. table.concat(lines, ",\n") .. "\n" .. string.rep(" ", lvl) .. "}"
-        elseif t == "string" then
-            return string.format("%q", v)
-        else
-            return tostring(v)
-        end
-    end
-    return serialize_value(val, indent)
-end
-
-local function load_table(path, default)
-    local f = io.open(path, "r")
-    if not f then return default or {} end
-    local content = f:read("*a")
-    f:close()
-    local fn, err = load("return " .. content)
-    if not fn then return default or {} end
-    local ok, res = pcall(fn)
-    if not ok then return default or {} end
-    return res
-end
-
-local function save_table(path, tbl)
-    local f, err = io.open(path, "w")
-    if not f then return false end
-    f:write(serialize(tbl))
-    f:close()
-    return true
-end
-
--- ----------------------------------------------------------------------
--- Settings and notes
--- ----------------------------------------------------------------------
+-- ======================================================================
+-- Persistent state
+-- ======================================================================
 local settings = {
     go_to_folder_id = nil,
-    pin_mode = "Default",          -- one of the mode names
+    pin_mode = "Default",
     pin_preset = { inL = 1, inR = 2, outL = 1, outR = 2 },
-    sort_column = 0,               -- 0=Name, 1=Type, 2=Developer, 3=Tags
+    sort_column = 0,     -- 0=Name,1=Type,2=Developer,3=Tags
     sort_ascending = true,
+        status_bar_height = 50,
+         insert_target = 0,   -- 0 = track, 1 = take (active take of selected item)
 }
-
-local notes_tags = {}  -- each entry: { note = string, tags = {string,...}, pin = { inL, inR, outL, outR } }
+local notes_tags = {}    -- [plugin_name] = { note = string, tags = {...}, pin = {inL,inR,outL,outR} }
 
 settings = load_table(SETTINGS_FILE, settings)
 notes_tags = load_table(NOTES_TAGS_FILE, {})
 
--- Migrate old pin_preset formats to simple track channels
-if type(settings.pin_preset) == "table" then
-    if settings.pin_preset.inL_pin then  -- old format with pin numbers
-        settings.pin_preset = {
-            inL = settings.pin_preset.inL_track or 1,
-            inR = settings.pin_preset.inR_track or 2,
-            outL = settings.pin_preset.outL_track or 1,
-            outR = settings.pin_preset.outR_track or 2
-        }
-    elseif settings.pin_preset.inL then
-        -- already simple, ensure all fields
-        settings.pin_preset = {
-            inL = settings.pin_preset.inL or 1,
-            inR = settings.pin_preset.inR or 2,
-            outL = settings.pin_preset.outL or 1,
-            outR = settings.pin_preset.outR or 2
-        }
-    else
-        settings.pin_preset = { inL = 1, inR = 2, outL = 1, outR = 2 }
-    end
+-- Normalize pin_preset
+if type(settings.pin_preset) ~= "table" then
+    settings.pin_preset = get_mode_preset(settings.pin_mode)
 else
-    settings.pin_preset = { inL = 1, inR = 2, outL = 1, outR = 2 }
+    settings.pin_preset = {
+        inL = clamp_channel(settings.pin_preset.inL or 1),
+        inR = clamp_channel(settings.pin_preset.inR or 2),
+        outL = clamp_channel(settings.pin_preset.outL or 1),
+        outR = clamp_channel(settings.pin_preset.outR or 2),
+    }
 end
 
--- ----------------------------------------------------------------------
--- UI state
--- ----------------------------------------------------------------------
+-- ======================================================================
+-- UI / runtime state
+-- ======================================================================
 local state = {
+first_run = true,
     stay_open = false,
     close_requested = false,
     column2_search = "",
@@ -293,113 +453,232 @@ local state = {
     selected_plugins = {},
     last_clicked_index = nil,
     pin_popup_open = false,
+    editing_chain_idx = nil,
     note_edit_popup_open = false,
     tag_edit_popup_open = false,
-    tag_filter = {},
     custom_pin_popup_open = false,
+    confirmation_popup_open = false,
+    tag_filter = {},
     confirmation_data = nil,
     editing_plugin_name = nil,
     edit_buffer = "",
     pending_add = nil,
     custom_pin_force_custom = false,
-    custom_pin_buffer = { inL = 1, inR = 2, outL = 1, outR = 2 },  -- for per‑plugin edits
+    custom_pin_mode = nil,          -- <-- add this
+    custom_pin_buffer = { inL = 1, inR = 2, outL = 1, outR = 2 },
+    insert_target = 0, 
+    custom_select = false,
+    active_popup = nil,
+    key_shortcuts = true,
+    
+    
+    -- Chain (Column 1)
+    current_view = "plugins",   -- "plugins" or "chain"
+    chain_plugins = {},
+    -- Use:
+    chain_selected_set = {},   -- table of 1‑based indices
+    last_chain_selected_idx = nil,
+    
+    full_note_popup_open = false,
+    full_note_text = "",
+    full_note_plugin = "",
+    
+    resize_dragging = false,
+    resize_start_y = 0,
+    resize_start_height = 0,
+    
+    rename_popup_open = false,
+    renaming_plugin = nil,
+    rename_buffer = "",
+    temp_renames = {},   -- key: original plugin name, value: custom display name
+            
+    chain_rename_popup_open = false,
+    chain_renaming_idx = nil,      -- 0‑based index of chain item being renamed
+    chain_rename_buffer = "",
 }
 
--- ----------------------------------------------------------------------
--- Initial parse and folder tree
--- ----------------------------------------------------------------------
+
+local function format_pin_display(config, is_global)
+ 
+   -- Per‑plugin config
+          if not config then return "Global" end
+          -- If it has a mode (e.g., "In→SC"), display that instead of numbers
+          if config.mode then
+              local in_text, out_text = get_global_pin_text(config.mode, settings.pin_preset)
+              return string.format("%s → %s", in_text, out_text)
+          else
+              -- Fixed numbers
+              local in_text = pair_text(config.inL, config.inR)
+              local out_text = pair_text(config.outL, config.outR)
+              return string.format("%s → %s", in_text, out_text)
+          end
+end
+
+    -- Helper to handle plugin selection (same as Name column logic)
+    local function select_plugin(name, idx, filtered, mods, shift, ctrl)
+        if ctrl then
+            if state.selected_plugins[name] then
+                state.selected_plugins[name] = nil
+            else
+                state.selected_plugins[name] = true
+            end
+        elseif shift and state.last_clicked_index then
+            local start_i = math.min(state.last_clicked_index, idx)
+            local end_i = math.max(state.last_clicked_index, idx)
+            state.selected_plugins = {}
+            for j = start_i, end_i do
+                state.selected_plugins[filtered[j].name] = true
+            end
+        else
+            state.selected_plugins = { [name] = true }
+            state.last_clicked_index = idx
+        end
+        -- Clear chain selection
+        state.chain_selected_idx = nil
+    end
+    
+    -- Helper for chain selection (mimics select_plugin)
+    local function select_chain_item(idx, filtered, mods, shift, ctrl)
+        if ctrl then
+            if state.chain_selected_set[idx] then
+                state.chain_selected_set[idx] = nil
+            else
+                state.chain_selected_set[idx] = true
+            end
+        elseif shift and state.last_chain_selected_idx then
+            local start_i = math.min(state.last_chain_selected_idx, idx)
+            local end_i = math.max(state.last_chain_selected_idx, idx)
+            state.chain_selected_set = {}
+            for j = start_i, end_i do
+                state.chain_selected_set[j] = true
+            end
+        else
+            state.chain_selected_set = { [idx] = true }
+            state.last_chain_selected_idx = idx
+        end
+    end
+
+-- ======================================================================
+-- Folder / tag lookup helpers
+-- ======================================================================
+
 local folder_tree = parse_fx_folders()
 if #folder_tree == 0 then
     r.ShowMessageBox("No folders found. Please create custom folders in REAPER's FX browser.", "Info", 0)
 end
-
--- Set go‑to folder
 if #folder_tree > 0 and not settings.go_to_folder_id then
     settings.go_to_folder_id = folder_tree[1].guid
 end
 state.selected_folder_guid = settings.go_to_folder_id
 
--- ----------------------------------------------------------------------
--- Helper functions
--- ----------------------------------------------------------------------
-local function center_next_popup()
-    local main_x, main_y = r.ImGui_GetWindowPos(ctx)
-    local main_w, main_h = r.ImGui_GetWindowSize(ctx)
-    local center_x = main_x + main_w/2
-    local center_y = main_y + main_h/2
-    r.ImGui_SetNextWindowPos(ctx, center_x, center_y, r.ImGui_Cond_Appearing(), 0.5, 0.1)
+local function find_folder_node(guid)
+    for i = 1, #folder_tree do
+        if folder_tree[i].guid == guid then return folder_tree[i] end
+    end
+    return nil
 end
 
-local function clamp_channel(val)
-    if val < 1 then return 1 end
-    if val > 64 then return 64 end
-    return val
+
+local function get_target_name(target_type)
+    if target_type == 0 then
+        local track = r.GetSelectedTrack(0, 0)
+        if not track then
+            return "No track selected (new track will be created)"
+        end
+        local _, name = r.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
+        if name and name ~= "" then
+            return  "Selected: " .. name
+        else
+            local track_num = r.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER")
+            return "Selected: Track " .. tostring(math.tointeger(track_num))
+        end
+    else
+        local item = r.GetSelectedMediaItem(0, 0)
+        if not item then
+            return "No item selected (fallback to track)"
+        end
+        local take = r.GetActiveTake(item)
+        if not take then
+            return "No active take (fallback to track)"
+        end
+        local name = r.GetTakeName(take)
+        if name and name ~= "" then
+            return "Selected: ".. name
+        else
+            -- Could get item index and take index, but we'll keep simple
+            return "Selected: (unnamed)"
+        end
+    end
 end
 
--- Clean plugin name (remove prefix and trailing developer parentheses)
-local function get_clean_name(p)
-    return p.name:gsub("^%a+%d*:%s*", ""):gsub("%s*%([^)]*%)$", "")
+local function get_folder_plugins(guid)
+    local node = find_folder_node(guid)
+    return node and node.plugins or {}
 end
 
--- Get all unique tags from notes_tags
-local function get_all_tags()
+local function get_tags_in_folder(guid)
+    local plugins = get_folder_plugins(guid)
     local tags = {}
-    for _, nt in pairs(notes_tags) do
-        if nt.tags then
+    for _, p in ipairs(plugins) do
+        local nt = notes_tags[p.name]
+        if nt and nt.tags then
             for _, tag in ipairs(nt.tags) do
                 tags[tag] = true
             end
         end
     end
     local sorted = {}
-    for tag in pairs(tags) do table.insert(sorted, tag) end
+    for tag in pairs(tags) do sorted[#sorted + 1] = tag end
     table.sort(sorted)
     return sorted
 end
 
--- Find folder node by GUID
-local function find_folder_node(guid)
-    for _, node in ipairs(folder_tree) do
-        if node.guid == guid then return node end
+local function get_clean_name(p)
+    -- Return custom display name if set
+    if state.temp_renames[p.name] then
+        return state.temp_renames[p.name]
     end
-    return nil
+    local name = p and p.name or ""
+    name = name:gsub("^%s*[^:]+:%s*", "")
+    name = name:gsub("%s*%([^)]*%)$", "")
+    return name
 end
 
--- Get plugins of a folder (array of metadata tables)
-local function get_folder_plugins(guid)
-    local node = find_folder_node(guid)
-    return node and node.plugins or {}
-end
-
--- Find first unused stereo pair starting from a given channel (e.g., 3)
-local function find_unused_stereo_pair(track, start_ch)
+-- ======================================================================
+-- Pin routing helpers
+-- ======================================================================
+local function find_unused_stereo_pair(target, start_ch, is_take)
     start_ch = start_ch or 3
     local used = {}
-    local fx_count = r.TrackFX_GetCount(track)
-    for fx = 0, fx_count-1 do
-        local _, in_cnt, out_cnt = r.TrackFX_GetIOSize(track, fx)
-        -- Input mappings
-        for pin = 0, in_cnt-1 do
-            local low, high = r.TrackFX_GetPinMappings(track, fx, 0, pin)
-            for ch = 0, 31 do
-                if (low & (1 << ch)) ~= 0 then used[ch+1] = true end
-            end
-            for ch = 32, 63 do
-                if (high & (1 << (ch-32))) ~= 0 then used[ch+1] = true end
-            end
+    local fx_count = is_take and r.TakeFX_GetCount(target) or r.TrackFX_GetCount(target)
+    for fx = 0, fx_count - 1 do
+        local _, in_cnt, out_cnt
+        if is_take then
+            _, in_cnt, out_cnt = r.TakeFX_GetIOSize(target, fx)
+        else
+            _, in_cnt, out_cnt = r.TrackFX_GetIOSize(target, fx)
         end
-        -- Output mappings
-        for pin = 0, out_cnt-1 do
-            local low, high = r.TrackFX_GetPinMappings(track, fx, 1, pin)
-            for ch = 0, 31 do
-                if (low & (1 << ch)) ~= 0 then used[ch+1] = true end
+        for pin = 0, in_cnt - 1 do
+            local low, high
+            if is_take then
+                low, high = r.TakeFX_GetPinMappings(target, fx, 0, pin)
+            else
+                low, high = r.TrackFX_GetPinMappings(target, fx, 0, pin)
             end
-            for ch = 32, 63 do
-                if (high & (1 << (ch-32))) ~= 0 then used[ch+1] = true end
+            for ch = 0, 31 do if (low & (1 << ch)) ~= 0 then used[ch + 1] = true end end
+            for ch = 32, 63 do if (high & (1 << (ch - 32))) ~= 0 then used[ch + 1] = true end end
+        end
+        for pin = 0, out_cnt - 1 do
+            local low, high
+            if is_take then
+                low, high = r.TakeFX_GetPinMappings(target, fx, 1, pin)
+            else
+                low, high = r.TrackFX_GetPinMappings(target, fx, 1, pin)
             end
+            for ch = 0, 31 do if (low & (1 << ch)) ~= 0 then used[ch + 1] = true end end
+            for ch = 32, 63 do if (high & (1 << (ch - 32))) ~= 0 then used[ch + 1] = true end end
         end
     end
-
     for pair = start_ch, 63, 2 do
         if not used[pair] and not used[pair+1] then
             return pair, pair+1
@@ -408,236 +687,371 @@ local function find_unused_stereo_pair(track, start_ch)
     return nil, nil
 end
 
--- Human‑readable description for each mode
-local function get_preset_description(mode)
-    if mode == "Default" then
-        return "Default: Input and output both use channels 1/2."
-    elseif mode == "SC→SC" then
-        return "SC→SC: Input and output both use the same unused stereo pair (auto)."
+local function resolve_mode_channels(mode, custom, side)
+    if mode == "Default" then return 1, 2
+    elseif mode == "SC→SC" then return nil, nil
     elseif mode == "In→SC" then
-        return "In→SC: Input uses 1/2, output uses an unused stereo pair (auto)."
+        if side == 0 then return 1, 2 else return nil, nil end
     elseif mode == "SC→Out" then
-        return "SC→Out: Input uses an unused stereo pair (auto), output uses 1/2."
+        if side == 0 then return nil, nil else return 1, 2 end
     elseif mode == "In→Left" then
-        return "In→Left: Input uses 1/2, output sends left only to channel 1."
+        if side == 0 then return 1, 2 else return 1, 1 end
     elseif mode == "In→Right" then
-        return "In→Right: Input uses 1/2, output sends right only to channel 2."
+        if side == 0 then return 1, 2 else return 2, 2 end
     elseif mode == "SC→Left" then
-        return "SC→Left: Input uses an unused stereo pair (auto), output sends left only to channel 1."
+        if side == 0 then return nil, nil else return 1, 1 end
     elseif mode == "SC→Right" then
-        return "SC→Right: Input uses an unused stereo pair (auto), output sends right only to channel 2."
+        if side == 0 then return nil, nil else return 2, 2 end
     elseif mode == "Left→Out" then
-        return "Left→Out: Input takes left only from channel 1, output sends to 1/2."
+        if side == 0 then return 1, 1 else return 1, 2 end
     elseif mode == "Right→Out" then
-        return "Right→Out: Input takes right only from channel 2, output sends to 1/2."
+        if side == 0 then return 2, 2 else return 1, 2 end
     elseif mode == "Left→SC" then
-        return "Left→SC: Input takes left only from channel 1, output uses an unused stereo pair (auto)."
+        if side == 0 then return 1, 1 else return nil, nil end
     elseif mode == "Right→SC" then
-        return "Right→SC: Input takes right only from channel 2, output uses an unused stereo pair (auto)."
+        if side == 0 then return 2, 2 else return nil, nil end
     elseif mode == "Custom" then
-        return "Custom: Manually set all four track channels."
-    else
-        return ""
+        if side == 0 then return custom.inL, custom.inR else return custom.outL, custom.outR end
     end
+    return 1, 2
 end
 
--- Format pin display for a given config (or global)
-local function format_pin_display(config, is_global)
-    if is_global then
-        local mode = settings.pin_mode
-        local p = settings.pin_preset
-        local in_text, out_text
-        if mode == "Default" then
-            in_text = string.format("%d/%d", p.inL, p.inR)
-            out_text = string.format("%d/%d", p.outL, p.outR)
-        elseif mode == "SC→SC" then
-            in_text = "auto"; out_text = "auto"
-        elseif mode == "In→SC" then
-            in_text = string.format("%d/%d", p.inL, p.inR); out_text = "auto"
-        elseif mode == "SC→Out" then
-            in_text = "auto"; out_text = string.format("%d/%d", p.outL, p.outR)
-        elseif mode == "In→Left" then
-            in_text = string.format("%d/%d", p.inL, p.inR); out_text = string.format("%d/%d", p.outL, p.outR)
-        elseif mode == "In→Right" then
-            in_text = string.format("%d/%d", p.inL, p.inR); out_text = string.format("%d/%d", p.outL, p.outR)
-        elseif mode == "SC→Left" then
-            in_text = "auto"; out_text = string.format("%d/%d", p.outL, p.outR)
-        elseif mode == "SC→Right" then
-            in_text = "auto"; out_text = string.format("%d/%d", p.outL, p.outR)
-        elseif mode == "Left→Out" then
-            in_text = string.format("%d/%d", p.inL, p.inR); out_text = string.format("%d/%d", p.outL, p.outR)
-        elseif mode == "Right→Out" then
-            in_text = string.format("%d/%d", p.inL, p.inR); out_text = string.format("%d/%d", p.outL, p.outR)
-        elseif mode == "Left→SC" then
-            in_text = string.format("%d/%d", p.inL, p.inR); out_text = "auto"
-        elseif mode == "Right→SC" then
-            in_text = string.format("%d/%d", p.inL, p.inR); out_text = "auto"
-        elseif mode == "Custom" then
-            in_text = string.format("%d/%d", p.inL, p.inR)
-            out_text = string.format("%d/%d", p.outL, p.outR)
-        else
-            in_text = "?"; out_text = "?"
-        end
-        return string.format("%s → %s", in_text, out_text)
+-- func apply pin config
+local function apply_pin_config(target, fx_index, mode, custom, bypass_confirmation, work, is_take)
+    if not target or fx_index < 0 then return true end
+
+    -- If custom contains a mode, use that mode and ignore its numbers
+    if custom and custom.mode then
+        mode = custom.mode
+        custom = nil
+    end
+
+    local inL, inR, outL, outR
+    if work then
+        inL, inR = work.inL, work.inR
+        outL, outR = work.outL, work.outR
     else
-        if not config then return "Global" end
-        local b = config
-        if     b.inL == 1 and b.inR == 2 and b.outL == 1 and b.outR == 2 then return "1/2 → 1/2"
-        elseif b.inL == 3 and b.inR == 4 and b.outL == 3 and b.outR == 4 then return "auto → auto"
-        elseif b.inL == 1 and b.inR == 2 and b.outL == 3 and b.outR == 4 then return "1/2 → auto"
-        elseif b.inL == 3 and b.inR == 4 and b.outL == 1 and b.outR == 2 then return "auto → 1/2"
-        elseif b.inL == 1 and b.inR == 2 and b.outL == 1 and b.outR == 1 then return "1/2 → 1/1"
-        elseif b.inL == 1 and b.inR == 2 and b.outL == 2 and b.outR == 2 then return "1/2 → 2/2"
-        elseif b.inL == 3 and b.inR == 4 and b.outL == 1 and b.outR == 1 then return "auto → 1/1"
-        elseif b.inL == 3 and b.inR == 4 and b.outL == 2 and b.outR == 2 then return "auto → 2/2"
-        elseif b.inL == 1 and b.inR == 1 and b.outL == 1 and b.outR == 2 then return "1/1 → 1/2"
-        elseif b.inL == 2 and b.inR == 2 and b.outL == 1 and b.outR == 2 then return "2/2 → 1/2"
-        elseif b.inL == 1 and b.inR == 1 and b.outL == 3 and b.outR == 4 then return "1/1 → auto"
-        elseif b.inL == 2 and b.inR == 2 and b.outL == 3 and b.outR == 4 then return "2/2 → auto"
-        else return string.format("%d/%d → %d/%d", b.inL, b.inR, b.outL, b.outR)
+        -- dynamic resolution
+        inL, inR = resolve_mode_channels(mode, custom, 0)
+        outL, outR = resolve_mode_channels(mode, custom, 1)
+        local need_input = (inL == nil)
+        local need_output = (outL == nil)
+
+        if need_input or need_output then
+            -- Collect used input/output channels separately
+            local used_input = {}
+            local used_output = {}
+            local fx_count = is_take and r.TakeFX_GetCount(target) or r.TrackFX_GetCount(target)
+            for fx = 0, fx_count - 1 do
+                local _, in_cnt, out_cnt
+                if is_take then
+                    _, in_cnt, out_cnt = r.TakeFX_GetIOSize(target, fx)
+                else
+                    _, in_cnt, out_cnt = r.TrackFX_GetIOSize(target, fx)
+                end
+                for pin = 0, in_cnt - 1 do
+                    local low, high
+                    if is_take then
+                        low, high = r.TakeFX_GetPinMappings(target, fx, 0, pin)
+                    else
+                        low, high = r.TrackFX_GetPinMappings(target, fx, 0, pin)
+                    end
+                    for ch = 0, 31 do if (low & (1 << ch)) ~= 0 then used_input[ch + 1] = true end end
+                    for ch = 32, 63 do if (high & (1 << (ch - 32))) ~= 0 then used_input[ch + 1] = true end end
+                end
+                for pin = 0, out_cnt - 1 do
+                    local low, high
+                    if is_take then
+                        low, high = r.TakeFX_GetPinMappings(target, fx, 1, pin)
+                    else
+                        low, high = r.TrackFX_GetPinMappings(target, fx, 1, pin)
+                    end
+                    for ch = 0, 31 do if (low & (1 << ch)) ~= 0 then used_output[ch + 1] = true end end
+                    for ch = 32, 63 do if (high & (1 << (ch - 32))) ~= 0 then used_output[ch + 1] = true end end
+                end
+            end
+
+            local function find_free_pair(start, used_table)
+                for pair = start, 63, 2 do
+                    if not used_table[pair] and not used_table[pair+1] then
+                        return pair, pair+1
+                    end
+                end
+                return nil, nil
+            end
+
+            if need_input then
+                local pairL, pairR = find_free_pair(3, used_input)
+                if not pairL then
+                    return false, "No unused stereo pair available for SC input (all channels 3-64 are occupied as inputs)."
+                end
+                inL, inR = pairL, pairR
+            end
+            if need_output then
+                local pairL, pairR = find_free_pair(3, used_output)
+                if not pairL then
+                    return false, "No unused stereo pair available for SC output (all channels 3-64 are occupied as outputs)."
+                end
+                outL, outR = pairL, pairR
+            end
         end
     end
-end
 
--- ----------------------------------------------------------------------
--- Pin application (mode‑aware)
--- ----------------------------------------------------------------------
-local function apply_pin_config(track, fx_index, mode, custom, bypass_confirmation)
-    if not track or fx_index < 0 then return true end
+    local work_tbl = { inL = inL, inR = inR, outL = outL, outR = outR }
+    local needed = math.max(work_tbl.inL, work_tbl.inR, work_tbl.outL, work_tbl.outR, 2)
 
-    local function get_side_channels(side)
-        if mode == "Default" then return 1, 2
-        elseif mode == "SC→SC" then return nil, nil
-        elseif mode == "In→SC" then
-            if side == 0 then return 1, 2 else return nil, nil end
-        elseif mode == "SC→Out" then
-            if side == 0 then return nil, nil else return 1, 2 end
-        elseif mode == "In→Left" then
-            if side == 0 then return 1, 2 else return 1, 1 end
-        elseif mode == "In→Right" then
-            if side == 0 then return 1, 2 else return 2, 2 end
-        elseif mode == "SC→Left" then
-            if side == 0 then return nil, nil else return 1, 1 end
-        elseif mode == "SC→Right" then
-            if side == 0 then return nil, nil else return 2, 2 end
-        elseif mode == "Left→Out" then
-            if side == 0 then return 1, 1 else return 1, 2 end
-        elseif mode == "Right→Out" then
-            if side == 0 then return 2, 2 else return 1, 2 end
-        elseif mode == "Left→SC" then
-            if side == 0 then return 1, 1 else return nil, nil end
-        elseif mode == "Right→SC" then
-            if side == 0 then return 2, 2 else return nil, nil end
-        elseif mode == "Custom" then
-            if side == 0 then return custom.inL, custom.inR else return custom.outL, custom.outR end
-        else return 1, 2 end
-    end
-
-    local inL, inR = get_side_channels(0)
-    local outL, outR = get_side_channels(1)
-
-    local need_input = (inL == nil)
-    local need_output = (outL == nil)
-    local pair = nil
-    if need_input or need_output then
-        pair = find_unused_stereo_pair(track, 3)
-        if not pair then
-            return false, "No unused stereo pair available for SC mode (all channels 3-64 are occupied)."
+    if not is_take then
+        -- Track: adjust track channels if needed
+        local current_channels = r.GetMediaTrackInfo_Value(target, "I_NCHAN")
+        if needed > current_channels and not bypass_confirmation then
+            return false, string.format("Track has %d channels, but need %d. Increase track channels?", current_channels, needed)
         end
-    end
-
-    if need_input then inL, inR = pair, pair+1 end
-    if need_output then outL, outR = pair, pair+1 end
-
-    local work = { inL = inL, inR = inR, outL = outL, outR = outR }
-
-    local needed = math.max(work.inL, work.inR, work.outL, work.outR, 2)
-    local current_channels = r.GetMediaTrackInfo_Value(track, "I_NCHAN")
-
-    if needed > current_channels and not bypass_confirmation then
-        return false, string.format("Track has %d channels, but need %d. Increase track channels?", current_channels, needed)
-    end
-
-    if needed > current_channels then
-        r.SetMediaTrackInfo_Value(track, "I_NCHAN", needed)
-    end
-
-    local function set_pin_mapping(isOut, pin, track_ch)
+        if needed > current_channels then
+            r.SetMediaTrackInfo_Value(target, "I_NCHAN", needed)
+        end
+ else
+     -- Take: adjust take channels if needed
+     local current_channels = r.GetMediaItemTakeInfo_Value(target, "I_TAKEFX_NCH")
+     if needed > current_channels and not bypass_confirmation then
+         return false, string.format("Take has %d channels, but need %d. Increase take channels?", current_channels, needed)
+     end
+     if needed > current_channels then
+         local ok = r.SetMediaItemTakeInfo_Value(target, "I_TAKEFX_NCH", needed)
+     end
+ end
+    
+    -- Helper to set a pin mapping (works for both track and take)
+    local function set_pin_mapping(is_out, pin, track_ch)
         if not track_ch then return end
         local pin_zero = pin
         local ch_zero = track_ch - 1
-        if pin_zero < 0 or ch_zero < 0 then return end
         local low, high = 0, 0
         if ch_zero < 32 then low = 1 << ch_zero else high = 1 << (ch_zero - 32) end
-        r.TrackFX_SetPinMappings(track, fx_index, isOut, pin_zero, low, high)
+        if is_take then
+            r.TakeFX_SetPinMappings(target, fx_index, is_out, pin_zero, low, high)
+        else
+            r.TrackFX_SetPinMappings(target, fx_index, is_out, pin_zero, low, high)
+        end
     end
 
-    set_pin_mapping(0, 0, work.inL)
-    set_pin_mapping(0, 1, work.inR)
-    set_pin_mapping(1, 0, work.outL)
-    set_pin_mapping(1, 1, work.outR)
-
+    set_pin_mapping(0, 0, work_tbl.inL)
+    set_pin_mapping(0, 1, work_tbl.inR)
+    set_pin_mapping(1, 0, work_tbl.outL)
+    set_pin_mapping(1, 1, work_tbl.outR)
     return true
 end
 
--- ----------------------------------------------------------------------
--- Plugin insertion queue
--- ----------------------------------------------------------------------
+
+-- Simulate a chain on a dummy track and return the maximum needed track channel
+
+local function simulate_chain_pins(chain, track)
+    -- Separate usage for input and output
+    local used_input = {}
+    local used_output = {}
+    local fx_count = r.TrackFX_GetCount(track)
+    for fx = 0, fx_count - 1 do
+        local _, in_cnt, out_cnt = r.TrackFX_GetIOSize(track, fx)
+        for pin = 0, in_cnt - 1 do
+            local low, high = r.TrackFX_GetPinMappings(track, fx, 0, pin)
+            for ch = 0, 31 do if (low & (1 << ch)) ~= 0 then used_input[ch + 1] = true end end
+            for ch = 32, 63 do if (high & (1 << (ch - 32))) ~= 0 then used_input[ch + 1] = true end end
+        end
+        for pin = 0, out_cnt - 1 do
+            local low, high = r.TrackFX_GetPinMappings(track, fx, 1, pin)
+            for ch = 0, 31 do if (low & (1 << ch)) ~= 0 then used_output[ch + 1] = true end end
+            for ch = 32, 63 do if (high & (1 << (ch - 32))) ~= 0 then used_output[ch + 1] = true end end
+        end
+    end
+
+    local work_list = {}
+    local max_needed = 0
+
+    for _, item in ipairs(chain) do
+        local inL, inR, outL, outR
+
+        -- Fixed‑number pins take precedence over any mode
+        if item.pin then
+            inL, inR = item.pin.inL, item.pin.inR
+            outL, outR = item.pin.outL, item.pin.outR
+        else
+            -- Mode‑based pin (or global fallback)
+            local mode = item.mode or settings.pin_mode
+
+            -- Helper to get side channels based on mode
+            local function get_side_channels(side)
+                if mode == "Default" then return 1, 2
+                elseif mode == "SC→SC" then return nil, nil
+                elseif mode == "In→SC" then
+                    if side == 0 then return 1, 2 else return nil, nil end
+                elseif mode == "SC→Out" then
+                    if side == 0 then return nil, nil else return 1, 2 end
+                elseif mode == "In→Left" then
+                    if side == 0 then return 1, 2 else return 1, 1 end
+                elseif mode == "In→Right" then
+                    if side == 0 then return 1, 2 else return 2, 2 end
+                elseif mode == "SC→Left" then
+                    if side == 0 then return nil, nil else return 1, 1 end
+                elseif mode == "SC→Right" then
+                    if side == 0 then return nil, nil else return 2, 2 end
+                elseif mode == "Left→Out" then
+                    if side == 0 then return 1, 1 else return 1, 2 end
+                elseif mode == "Right→Out" then
+                    if side == 0 then return 2, 2 else return 1, 2 end
+                elseif mode == "Left→SC" then
+                    if side == 0 then return 1, 1 else return nil, nil end
+                elseif mode == "Right→SC" then
+                    if side == 0 then return 2, 2 else return nil, nil end
+                else return 1, 2 end
+            end
+
+            inL, inR = get_side_channels(0)
+            outL, outR = get_side_channels(1)
+
+            -- Helper to find a free stereo pair for a given side
+            local function find_free_pair(start, used_table)
+                for pair = start, 63, 2 do
+                    if not used_table[pair] and not used_table[pair+1] then
+                        return pair, pair+1
+                    end
+                end
+                return nil, nil
+            end
+
+            local need_input = (inL == nil)
+            local need_output = (outL == nil)
+            if need_input then
+                local pairL, pairR = find_free_pair(3, used_input)
+                if not pairL then return nil, nil, "No unused stereo pair available for SC input" end
+                inL, inR = pairL, pairR
+                used_input[pairL] = true; used_input[pairR] = true
+            end
+            if need_output then
+                local pairL, pairR = find_free_pair(3, used_output)
+                if not pairL then return nil, nil, "No unused stereo pair available for SC output" end
+                outL, outR = pairL, pairR
+                used_output[pairL] = true; used_output[pairR] = true
+            end
+        end
+
+        work_list[#work_list + 1] = { inL = inL, inR = inR, outL = outL, outR = outR }
+        max_needed = math.max(max_needed, inL, inR, outL, outR, 2)
+
+        -- Mark used channels for subsequent plugins
+        used_input[inL] = true; used_input[inR] = true
+        used_output[outL] = true; used_output[outR] = true
+    end
+
+    return max_needed, work_list, nil
+end
+-- Simulate a chain and return the maximum needed track channel (without building)
+local function simulate_chain_max_channels(chain)
+    local dummy_track_idx = r.CountTracks(0)
+    r.InsertTrackAtIndex(dummy_track_idx, true)
+    local dummy_track = r.GetTrack(0, dummy_track_idx)
+    if not dummy_track then return 2 end
+
+    local max_needed, _, _ = simulate_chain_pins(chain, dummy_track)
+    if not max_needed then max_needed = 2 end
+
+    r.DeleteTrack(dummy_track)
+    return math.max(max_needed, 2)
+end
+-- ======================================================================
+-- Insertion queue (supports per‑plugin pin configs)
+-- ======================================================================
+-- process next pending
 local function process_next_pending()
     local p = state.pending_add
     if not p then return end
 
-    if p.index > #p.names then
-        if not state.stay_open then
-            state.close_requested = true
-        end
+    if p.index > #p.items then
+        if not state.stay_open then state.close_requested = true end
         state.pending_add = nil
         return
     end
 
-    local name = p.names[p.index]
-    local tr = nil
+    local item = p.items[p.index]
+    local tr = p.target_track
 
-    if p.to_new_track then
-        if p.per_track or p.index == 1 then
-            r.InsertTrackAtIndex(r.CountTracks(0), true)
-            tr = r.GetTrack(0, r.CountTracks(0)-1)
-            r.SetOnlyTrackSelected(tr)
-            table.insert(p.tracks, tr)
+    -- If no target track, determine one (for standalone insertion)
+    if not tr then
+        if p.to_new_track then
+            if p.per_track or p.index == 1 then
+                r.InsertTrackAtIndex(r.CountTracks(0), true)
+                tr = r.GetTrack(0, r.CountTracks(0) - 1)
+                r.SetOnlyTrackSelected(tr)
+                p.tracks[#p.tracks + 1] = tr
+            else
+                tr = p.tracks[#p.tracks]
+            end
         else
-            tr = p.tracks[#p.tracks]
-        end
-    else
-        local sel_tracks = {}
-        for i = 0, r.CountSelectedTracks(0)-1 do
-            sel_tracks[#sel_tracks+1] = r.GetSelectedTrack(0, i)
-        end
-        if #sel_tracks == 0 then
-            r.InsertTrackAtIndex(r.CountTracks(0), true)
-            tr = r.GetTrack(0, r.CountTracks(0)-1)
-            r.SetOnlyTrackSelected(tr)
-        else
-            tr = sel_tracks[1]
+            local sel_tracks = {}
+            for i = 0, r.CountSelectedTracks(0) - 1 do
+                sel_tracks[#sel_tracks + 1] = r.GetSelectedTrack(0, i)
+            end
+            if #sel_tracks == 0 then
+                r.InsertTrackAtIndex(r.CountTracks(0), true)
+                tr = r.GetTrack(0, r.CountTracks(0) - 1)
+                r.SetOnlyTrackSelected(tr)
+            else
+                tr = sel_tracks[1]
+            end
         end
     end
 
-    local mode = settings.pin_mode
-    local custom = nil
-    if notes_tags[name] and notes_tags[name].pin then
-        custom = notes_tags[name].pin
+    -- Handle chain items (should not happen here because chains are inserted atomically earlier,
+    -- but just in case)
+
+    local name = item.name
+    local mode = item.mode or settings.pin_mode
+    local custom = item.pin or settings.pin_preset
+
+    -- If item has a stored pin (fixed numbers), treat as Custom mode
+    if item.pin then
         mode = "Custom"
-    else
-        custom = settings.pin_preset
+        custom = item.pin
     end
 
-    local fx_idx = r.TrackFX_AddByName(tr, name, false, -1)
+    local is_take = false
+    local target = tr
+
+    if p.target_type == 1 then
+        local sel_item = r.GetSelectedMediaItem(0, 0)
+        if sel_item then
+            local take = r.GetActiveTake(sel_item)
+            if take then
+                target = take
+                is_take = true
+            end
+        end
+    end
+
+    local fx_idx
+    if is_take then
+        fx_idx = r.TakeFX_AddByName(target, name, 1)
+    else
+        fx_idx = r.TrackFX_AddByName(target, name, false, -1)
+    end
+
     if fx_idx < 0 then
         p.index = p.index + 1
         r.defer(process_next_pending)
         return
     end
 
-    local ok, msg = apply_pin_config(tr, fx_idx, mode, custom, p.bypass)
+    -- Apply rename if any
+    local final_rename = state.temp_renames[name]
+    if final_rename then
+        if is_take then
+            r.TakeFX_SetNamedConfigParm(target, fx_idx, "renamed_name", final_rename)
+        else
+            r.TrackFX_SetNamedConfigParm(target, fx_idx, "renamed_name", final_rename)
+        end
+    end
+
+    -- Apply pin config
+    local work = nil
+    local ok, msg = apply_pin_config(target, fx_idx, mode, custom, p.bypass, work, is_take)
     if ok then
         p.index = p.index + 1
         r.defer(process_next_pending)
@@ -646,83 +1060,400 @@ local function process_next_pending()
             message = msg,
             callback = function(confirmed)
                 if confirmed then
-                    local ok2, msg2 = apply_pin_config(tr, fx_idx, mode, custom, true)
+                    local ok2 = apply_pin_config(target, fx_idx, mode, custom, true, work, is_take)
                     if ok2 then p.index = p.index + 1 end
                 else
                     p.index = p.index + 1
                 end
                 r.defer(process_next_pending)
-            end
+            end,
         }
+    end
+end
+
+
+-- inserting fx chains logic and function -----
+-- Read .RfxChain file and return the inner FX chain chunk (without <FXCHAIN> and >)
+local function read_chain_inner(file_path)
+    local function try_open(path)
+        local f = io.open(path, "r")
+        if f then
+            local content = f:read("*a")
+            f:close()
+            return content
+        end
+        return nil
+    end
+
+    -- Try the given path first
+    local content = try_open(file_path)
+    if not content then
+        -- Try with lowercase extension
+        local lower_path = file_path:gsub("%.RfxChain$", ".rfxchain")
+        content = try_open(lower_path)
+        if not content and not file_path:match("%.RfxChain$") then
+            -- Try adding .RfxChain
+            content = try_open(file_path .. ".RfxChain")
+            if not content then
+                content = try_open(file_path .. ".rfxchain")
+            end
+        end
+        if not content then
+            r.ShowConsoleMsg("Chain file not found: " .. file_path .. "\n")
+            return nil
+        end
+    end
+
+    -- Remove BOM and normalize line endings
+    content = content:gsub("^\xEF\xBB\xBF", "")
+    content = content:gsub("\r", "")
+
+    -- Try to extract the block between <FXCHAIN and the line that is just ">"
+    local start_tag = "<FXCHAIN"
+    local start_pos = content:find(start_tag)
+    if start_pos then
+        local lines = {}
+        for line in content:gmatch("([^\n]*)\n?") do
+            lines[#lines + 1] = line
+        end
+        local start_idx, end_idx
+        for i, line in ipairs(lines) do
+            if line:find(start_tag) then start_idx = i end
+            if line:match("^%s*>%s*$") then end_idx = i end
+        end
+        if start_idx and end_idx and start_idx < end_idx then
+            local inner_lines = {}
+            for i = start_idx + 1, end_idx - 1 do
+                inner_lines[#inner_lines + 1] = lines[i]
+            end
+            return table.concat(inner_lines, "\n")
+        end
+    end
+
+    -- If no block, assume the whole file is the inner content
+    return content
+end
+
+
+-- Append a chunk to the track's FX chain (at the end). If the track has no FX chain, create one.
+local function append_fx_chunk(track, chunk)
+    local _, track_chunk = r.GetTrackStateChunk(track, "", false)
+    local fxchain_start = track_chunk:find("<FXCHAIN")
+    if not fxchain_start then
+        -- No FX chain, create one at the end before the closing > of the track block
+        local last_gt = track_chunk:reverse():find(">") or 0
+        if last_gt > 0 then
+            local pos = #track_chunk - last_gt + 1
+            local new_block = "<FXCHAIN\n" .. chunk .. "\n>\n"
+            track_chunk = track_chunk:sub(1, pos-1) .. new_block .. track_chunk:sub(pos)
+            r.SetTrackStateChunk(track, track_chunk, false)
+            return true
+        else
+            return false
+        end
+    end
+    -- Existing FXCHAIN block: find the closing > (as before)
+    local pos = fxchain_start
+    local depth = 1
+    local last_gt = nil
+    while pos <= #track_chunk do
+        local next_lt = track_chunk:find("\n<", pos, true)
+        local next_gt = track_chunk:find("\n>\n", pos, true)
+        if not next_lt and not next_gt then break end
+        if next_lt and (not next_gt or next_lt < next_gt) then
+            depth = depth + 1
+            pos = next_lt + 1
+        else
+            depth = depth - 1
+            pos = next_gt + 1
+            if depth == 0 then
+                last_gt = next_gt
+                break
+            end
+        end
+    end
+    if not last_gt then return false end
+    -- Insert the new chunk before the closing > (i.e., inside the block)
+    local new_chunk = track_chunk:sub(1, last_gt-1) .. "\n" .. chunk .. "\n" .. track_chunk:sub(last_gt)
+    r.SetTrackStateChunk(track, new_chunk, false)
+    return true
+end
+
+-- For chain insertion, we need per‑item modes and customs.
+-- Insert a chain (table of items) into the selected track (or create a new one if none selected)
+local function add_chain_to_track(chain, bypass_confirmation)
+    if #chain == 0 then return end
+
+    -- Determine target track
+    local target_track = r.GetSelectedTrack(0, 0)
+    if not target_track then
+        r.InsertTrackAtIndex(r.CountTracks(0), true)
+        target_track = r.GetTrack(0, r.CountTracks(0) - 1)
+        r.SetOnlyTrackSelected(target_track)
+    end
+
+    -- Create a temporary track to build the chain
+    local temp_track_idx = r.CountTracks(0)
+    r.InsertTrackAtIndex(temp_track_idx, true)
+    local temp_track = r.GetTrack(0, temp_track_idx)
+    if not temp_track then return end
+
+    -- Add items in order to the temporary track (always with bypass = true to avoid internal confirmations)
+    for _, item in ipairs(chain) do
+        if item.is_fxchain and item.chain_path then
+            local inner_chunk = read_chain_inner(item.chain_path)
+            if inner_chunk then
+                append_fx_chunk(temp_track, inner_chunk)
+            else
+                r.ShowMessageBox("Could not read chain file: " .. item.chain_path, "Error", 0)
+            end
+        else
+            local mode = item.mode or settings.pin_mode
+            local custom = item.pin or settings.pin_preset
+            local fx_idx = r.TrackFX_AddByName(temp_track, item.name, false, -1)
+            if fx_idx >= 0 then
+                apply_pin_config(temp_track, fx_idx, mode, custom, true, nil, false)
+                local final_name = item.temp_name or state.temp_renames[item.name]
+                if final_name then
+                    r.TrackFX_SetNamedConfigParm(temp_track, fx_idx, "renamed_name", final_name)
+                end
+            end
+        end
+    end
+
+    -- Check target track channels
+    local current_channels = r.GetMediaTrackInfo_Value(target_track, "I_NCHAN")
+    local max_needed = r.GetMediaTrackInfo_Value(temp_track, "I_NCHAN")
+    if max_needed < 2 then max_needed = 2 end
+
+    -- Function to extract and append the chain
+    local function insert()
+        local _, chunk = r.GetTrackStateChunk(temp_track, "", false)
+        local lines = {}
+        for line in chunk:gmatch("([^\n]*)\n?") do
+            lines[#lines + 1] = line
+        end
+        local start_idx, end_idx
+        for i = 1, #lines do
+            if lines[i]:find("<FXCHAIN") then start_idx = i; break end
+        end
+        for i = #lines, 1, -1 do
+            if lines[i]:match("^%s*>%s*$") then end_idx = i; break end
+        end
+        if not start_idx or not end_idx or start_idx >= end_idx then
+            r.ShowMessageBox("Failed to extract FX chain from temporary track.", "Error", 0)
+            r.DeleteTrack(temp_track)
+            return
+        end
+        local inner_lines = {}
+        for i = start_idx + 1, end_idx - 1 do
+            inner_lines[#inner_lines + 1] = lines[i]
+        end
+        local fxchain = table.concat(inner_lines, "\n")
+        append_fx_chunk(target_track, fxchain)
+        r.DeleteTrack(temp_track)
+        if not state.stay_open then state.close_requested = true end
+    end
+
+    -- Handle channel increase confirmation
+    if not bypass_confirmation and max_needed > current_channels then
+        state.confirmation_data = {
+            message = string.format(
+                "This chain requires up to %d channels. Track currently has %d. Increase track channels?",
+                max_needed, current_channels
+            ),
+            callback = function(confirmed)
+                if confirmed then
+                    r.SetMediaTrackInfo_Value(target_track, "I_NCHAN", max_needed)
+                    insert()
+                else
+                    r.DeleteTrack(temp_track)
+                end
+            end,
+        }
+    else
+        insert()
     end
 end
 
 local function add_plugins_to_track(names, to_new_track, per_track, bypass_confirmation)
     if #names == 0 then return end
+    local items = {}
+    for _, name in ipairs(names) do
+        local nt_pin = notes_tags[name] and notes_tags[name].pin
+        local mode = nil
+        local pin = nil
+        if nt_pin then
+            if nt_pin.mode then
+                mode = nt_pin.mode
+            else
+                pin = nt_pin
+                mode = "Custom"
+            end
+        end
+        table.insert(items, {
+            name = name,
+            pin = pin,
+            mode = mode,
+            is_fxchain = false,
+        })
+    end
     state.pending_add = {
-        names = names,
+        items = items,
         to_new_track = to_new_track,
         per_track = per_track,
         bypass = bypass_confirmation,
         index = 1,
-        tracks = {}
+        tracks = {},
+        target_track = nil,
     }
     process_next_pending()
 end
 
--- ----------------------------------------------------------------------
--- Popup drawing functions
--- ----------------------------------------------------------------------
--- Global pin configuration popup
-local function draw_pin_popup()
-    if state.pin_popup_open then
-     center_next_popup()
-        r.ImGui_OpenPopup(ctx, "Global Pin Settings")
-        state.pin_popup_open = false
-    end
-    if r.ImGui_BeginPopupModal(ctx, "Global Pin Settings", nil, r.ImGui_WindowFlags_AlwaysAutoResize()) then
-        local mode_names = {
-            "Default", "SC→SC", "In→SC", "SC→Out", "In→Left", "In→Right",
-            "SC→Left", "SC→Right", "Left→Out", "Right→Out", "Left→SC", "Right→SC", "Custom"
-        }
-        local current_mode_idx = 1
-        for i, name in ipairs(mode_names) do
-            if name == settings.pin_mode then current_mode_idx = i; break end
-        end
-        local changed, new_idx = r.ImGui_Combo(ctx, "Mode", current_mode_idx-1, table.concat(mode_names, "\0") .. "\0")
-        if changed then
-            local new_mode = mode_names[new_idx+1]
-            settings.pin_mode = new_mode
-            -- Update pin_preset to match preset
-            if new_mode == "Default" then
-                settings.pin_preset = { inL = 1, inR = 2, outL = 1, outR = 2 }
-            elseif new_mode == "SC→SC" then
-                settings.pin_preset = { inL = 3, inR = 4, outL = 3, outR = 4 }
-            elseif new_mode == "In→SC" then
-                settings.pin_preset = { inL = 1, inR = 2, outL = 3, outR = 4 }
-            elseif new_mode == "SC→Out" then
-                settings.pin_preset = { inL = 3, inR = 4, outL = 1, outR = 2 }
-            elseif new_mode == "In→Left" then
-                settings.pin_preset = { inL = 1, inR = 2, outL = 1, outR = 1 }
-            elseif new_mode == "In→Right" then
-                settings.pin_preset = { inL = 1, inR = 2, outL = 2, outR = 2 }
-            elseif new_mode == "SC→Left" then
-                settings.pin_preset = { inL = 3, inR = 4, outL = 1, outR = 1 }
-            elseif new_mode == "SC→Right" then
-                settings.pin_preset = { inL = 3, inR = 4, outL = 2, outR = 2 }
-            elseif new_mode == "Left→Out" then
-                settings.pin_preset = { inL = 1, inR = 1, outL = 1, outR = 2 }
-            elseif new_mode == "Right→Out" then
-                settings.pin_preset = { inL = 2, inR = 2, outL = 1, outR = 2 }
-            elseif new_mode == "Left→SC" then
-                settings.pin_preset = { inL = 1, inR = 1, outL = 3, outR = 4 }
-            elseif new_mode == "Right→SC" then
-                settings.pin_preset = { inL = 2, inR = 2, outL = 3, outR = 4 }
-            elseif new_mode == "Custom" then
-                -- keep current custom values
-            end
-        end
+-- Insert a list of items (each with name, pin, mode) directly via the queue,
+-- showing a single confirmation if track channels need to be increased.
+local function add_plugins_with_configs(items, bypass_confirmation)
+    if #items == 0 then return end
 
+    -- Determine target track
+    local target_track = r.GetSelectedTrack(0, 0)
+    if not target_track then
+        r.InsertTrackAtIndex(r.CountTracks(0), true)
+        target_track = r.GetTrack(0, r.CountTracks(0) - 1)
+        r.SetOnlyTrackSelected(target_track)
+    end
+
+    -- If not already bypassing, simulate to see if we need a confirmation
+    if not bypass_confirmation then
+        local max_needed = simulate_chain_max_channels(items)
+        local current_channels = r.GetMediaTrackInfo_Value(target_track, "I_NCHAN")
+        if max_needed > current_channels then
+            state.confirmation_data = {
+                message = string.format(
+                    "This chain requires up to %d channels. Track currently has %d. Increase track channels?",
+                    max_needed, current_channels
+                ),
+                callback = function(confirmed)
+                    if confirmed then
+                        r.SetMediaTrackInfo_Value(target_track, "I_NCHAN", max_needed)
+                        -- Now insert with bypass = true to avoid further pop‑ups
+                        add_plugins_with_configs(items, true)
+                    end
+                end,
+            }
+            return
+        end
+    end
+
+    -- Proceed with direct insertion
+    state.pending_add = {
+        items = items,
+        to_new_track = false,
+        per_track = false,
+        bypass = bypass_confirmation,   -- will be true if we came via confirmation
+        index = 1,
+        tracks = {},
+        target_track = target_track,
+    }
+    process_next_pending()
+end
+
+-- Helper to check if a chain contains any FX chain
+local function has_fxchain(chain)
+    for _, item in ipairs(chain) do
+        if item.is_fxchain then return true end
+    end
+    return false
+end
+
+-- Helper to get regular plugin names from a chain
+local function get_regular_plugin_names(chain)
+    local names = {}
+    for _, item in ipairs(chain) do
+        if not item.is_fxchain then
+            names[#names + 1] = item.name
+        end
+    end
+    return names
+end
+
+
+-- ======================================================================
+-- Popup helpers
+-- ======================================================================
+
+local focus_first = true -- to focus on the modal's input text once
+
+local function center_next_popup()
+    local main_x, main_y = r.ImGui_GetWindowPos(ctx)
+    local main_w, main_h = r.ImGui_GetWindowSize(ctx)
+    local center_x = main_x + main_w * 0.5
+    local center_y = main_y + main_h * 0.5
+    r.ImGui_SetNextWindowPos(ctx, center_x, center_y, r.ImGui_Cond_Appearing(), 0.5, 0.1)
+    
+end
+
+local function focus()
+    if focus_first then
+              r.ImGui_SetKeyboardFocusHere(ctx, 0)
+               focus_first = false
+         
+      end
+end
+
+local function begin_centered_modal(title, open_flag_field)
+    if state[open_flag_field] then
+        center_next_popup()
+        r.ImGui_OpenPopup(ctx, title)
+     elseif open_flag_field == "confirmation_popup_open" and state.confirmation_data and not state[open_flag_field] then
+      r.ImGui_OpenPopup(ctx, title)
+       state.confirmation_popup_open = true
+    end
+    state.active_popup = open_flag_field
+    local flags 
+    if open_flag_field == "full_note_popup_open" then flags = 0 else flags = r.ImGui_WindowFlags_AlwaysAutoResize() end
+    
+    return r.ImGui_BeginPopupModal(ctx, title, nil, flags)
+end
+
+local function draw_mode_combo(label, current_mode)
+    local current_idx = 1
+    for i = 1, #MODE_NAMES do
+        if MODE_NAMES[i] == current_mode then current_idx = i; break end
+    end
+    local changed, new_idx = r.ImGui_Combo(ctx, label, current_idx - 1, table.concat(MODE_NAMES, "\0") .. "\0")
+    return changed, (new_idx and MODE_NAMES[new_idx + 1] or current_mode)
+end
+
+local function apply_mode_preset(mode)
+    if MODE_PRESETS[mode] then
+        settings.pin_preset = {
+            inL = MODE_PRESETS[mode].inL,
+            inR = MODE_PRESETS[mode].inR,
+            outL = MODE_PRESETS[mode].outL,
+            outR = MODE_PRESETS[mode].outR,
+        }
+    end
+end
+
+local function close_popup(ctx)
+if state[state.active_popup] == true then
+r.ImGui_CloseCurrentPopup(ctx)
+state[state.active_popup] = false
+focus_first = true
+end
+end
+
+-- ======================================================================
+-- Popups (using begin_centered_modal)
+-- ======================================================================
+local function draw_pin_popup()
+    if begin_centered_modal("Global Pin Settings", "pin_popup_open") then
+        local changed, new_mode = draw_mode_combo("Mode", settings.pin_mode)
+        if changed then
+            settings.pin_mode = new_mode
+            apply_mode_preset(new_mode)
+        end
         if settings.pin_mode == "Custom" then
             r.ImGui_Separator(ctx)
             r.ImGui_Text(ctx, "Custom Track Channels:")
@@ -746,33 +1477,32 @@ local function draw_pin_popup()
             r.ImGui_PopItemWidth(ctx)
         else
             r.ImGui_Separator(ctx)
-            r.ImGui_TextWrapped(ctx, get_preset_description(settings.pin_mode))
+            r.ImGui_TextWrapped(ctx, get_mode_description(settings.pin_mode))
+            
         end
-
         r.ImGui_Separator(ctx)
         if r.ImGui_Button(ctx, "Close") then
-            r.ImGui_CloseCurrentPopup(ctx)
+            close_popup(ctx)
         end
         r.ImGui_EndPopup(ctx)
     end
 end
 
--- Per‑plugin custom pin popup
 local function draw_custom_pin_popup()
-    if state.custom_pin_popup_open then
-     center_next_popup()
-        r.ImGui_OpenPopup(ctx, "Custom Pin for " .. (state.editing_plugin_name or ""))
-        state.custom_pin_popup_open = false
-        state.custom_pin_force_custom = false
-    end
-    if r.ImGui_BeginPopupModal(ctx, "Custom Pin for " .. (state.editing_plugin_name or ""), nil, r.ImGui_WindowFlags_AlwaysAutoResize()) then
-        local preset_names = {
-            "Default", "SC→SC", "In→SC", "SC→Out", "In→Left", "In→Right",
-            "SC→Left", "SC→Right", "Left→Out", "Right→Out", "Left→SC", "Right→SC", "Custom"
-        }
-
-        local preset_index = 13
-        if not state.custom_pin_force_custom then
+    if begin_centered_modal("Custom Pin for " .. (state.editing_plugin_name or ""), "custom_pin_popup_open") then
+        -- Determine current preset index based on state
+        local preset_index = 13  -- default Custom
+        if state.custom_pin_force_custom then
+            preset_index = 13
+        elseif state.custom_pin_mode then
+            for i, name in ipairs(MODE_NAMES) do
+                if name == state.custom_pin_mode then
+                    preset_index = i
+                    break
+                end
+            end
+        else
+            -- Determine from buffer numbers
             local b = state.custom_pin_buffer
             if     b.inL == 1 and b.inR == 2 and b.outL == 1 and b.outR == 2 then preset_index = 1
             elseif b.inL == 3 and b.inR == 4 and b.outL == 3 and b.outR == 4 then preset_index = 2
@@ -789,42 +1519,22 @@ local function draw_custom_pin_popup()
             else preset_index = 13 end
         end
 
-        local changed, new_preset = r.ImGui_Combo(ctx, "Preset", preset_index-1, table.concat(preset_names, "\0") .. "\0")
+        -- Preset combo
+        local changed, new_idx = r.ImGui_Combo(ctx, "Preset", preset_index - 1, table.concat(MODE_NAMES, "\0") .. "\0")
         if changed then
-            local selected = new_preset + 1
+            local selected = new_idx + 1
             if selected == 13 then
                 state.custom_pin_force_custom = true
+                state.custom_pin_mode = nil
             else
                 state.custom_pin_force_custom = false
-                if selected == 1 then
-                    state.custom_pin_buffer = { inL = 1, inR = 2, outL = 1, outR = 2 }
-                elseif selected == 2 then
-                    state.custom_pin_buffer = { inL = 3, inR = 4, outL = 3, outR = 4 }
-                elseif selected == 3 then
-                    state.custom_pin_buffer = { inL = 1, inR = 2, outL = 3, outR = 4 }
-                elseif selected == 4 then
-                    state.custom_pin_buffer = { inL = 3, inR = 4, outL = 1, outR = 2 }
-                elseif selected == 5 then
-                    state.custom_pin_buffer = { inL = 1, inR = 2, outL = 1, outR = 1 }
-                elseif selected == 6 then
-                    state.custom_pin_buffer = { inL = 1, inR = 2, outL = 2, outR = 2 }
-                elseif selected == 7 then
-                    state.custom_pin_buffer = { inL = 3, inR = 4, outL = 1, outR = 1 }
-                elseif selected == 8 then
-                    state.custom_pin_buffer = { inL = 3, inR = 4, outL = 2, outR = 2 }
-                elseif selected == 9 then
-                    state.custom_pin_buffer = { inL = 1, inR = 1, outL = 1, outR = 2 }
-                elseif selected == 10 then
-                    state.custom_pin_buffer = { inL = 2, inR = 2, outL = 1, outR = 2 }
-                elseif selected == 11 then
-                    state.custom_pin_buffer = { inL = 1, inR = 1, outL = 3, outR = 4 }
-                elseif selected == 12 then
-                    state.custom_pin_buffer = { inL = 2, inR = 2, outL = 3, outR = 4 }
-                end
+                state.custom_pin_mode = MODE_NAMES[selected]
+                state.custom_pin_buffer = get_mode_preset(state.custom_pin_mode)
             end
         end
 
-        if preset_index == 13 or state.custom_pin_force_custom then
+        -- Show manual fields only if we are in custom mode (selected preset is Custom)
+        if (preset_index == 13 or state.custom_pin_force_custom) then
             r.ImGui_Separator(ctx)
             r.ImGui_Text(ctx, "Manual Track Channels:")
             r.ImGui_PushItemWidth(ctx, 60)
@@ -833,230 +1543,978 @@ local function draw_custom_pin_popup()
             r.ImGui_Text(ctx, "Out L"); r.ImGui_SameLine(ctx, 190)
             r.ImGui_Text(ctx, "Out R")
             local changed_val
-            changed_val, state.custom_pin_buffer.inL = r.ImGui_DragInt(ctx, "##inL", state.custom_pin_buffer.inL, 1, 1, 64)
+            changed_val, state.custom_pin_buffer.inL = r.ImGui_DragInt(ctx, "##pin_inL", state.custom_pin_buffer.inL, 1, 1, 64)
             if changed_val then state.custom_pin_buffer.inL = clamp_channel(state.custom_pin_buffer.inL) end
             r.ImGui_SameLine(ctx)
-            changed_val, state.custom_pin_buffer.inR = r.ImGui_DragInt(ctx, "##inR", state.custom_pin_buffer.inR, 1, 1, 64)
+            changed_val, state.custom_pin_buffer.inR = r.ImGui_DragInt(ctx, "##pin_inR", state.custom_pin_buffer.inR, 1, 1, 64)
             if changed_val then state.custom_pin_buffer.inR = clamp_channel(state.custom_pin_buffer.inR) end
             r.ImGui_SameLine(ctx)
-            changed_val, state.custom_pin_buffer.outL = r.ImGui_DragInt(ctx, "##outL", state.custom_pin_buffer.outL, 1, 1, 64)
+            changed_val, state.custom_pin_buffer.outL = r.ImGui_DragInt(ctx, "##pin_outL", state.custom_pin_buffer.outL, 1, 1, 64)
             if changed_val then state.custom_pin_buffer.outL = clamp_channel(state.custom_pin_buffer.outL) end
             r.ImGui_SameLine(ctx)
-            changed_val, state.custom_pin_buffer.outR = r.ImGui_DragInt(ctx, "##outR", state.custom_pin_buffer.outR, 1, 1, 64)
+            changed_val, state.custom_pin_buffer.outR = r.ImGui_DragInt(ctx, "##pin_outR", state.custom_pin_buffer.outR, 1, 1, 64)
             if changed_val then state.custom_pin_buffer.outR = clamp_channel(state.custom_pin_buffer.outR) end
             r.ImGui_PopItemWidth(ctx)
         else
+            -- Show preset description
             r.ImGui_Separator(ctx)
-            r.ImGui_TextWrapped(ctx, get_preset_description(preset_names[preset_index]))
+            r.ImGui_TextWrapped(ctx, get_mode_description(MODE_NAMES[preset_index]))
         end
 
         r.ImGui_Separator(ctx)
         if r.ImGui_Button(ctx, "Save") then
             if state.editing_plugin_name then
-                if not notes_tags[state.editing_plugin_name] then
-                    notes_tags[state.editing_plugin_name] = {}
+                if state.editing_chain_idx ~= nil then
+                    local chain_idx = state.editing_chain_idx + 1
+                    if state.chain_plugins[chain_idx] then
+                        if (preset_index == 13 or state.custom_pin_force_custom) then
+                            state.chain_plugins[chain_idx].pin = {
+                                inL = state.custom_pin_buffer.inL,
+                                inR = state.custom_pin_buffer.inR,
+                                outL = state.custom_pin_buffer.outL,
+                                outR = state.custom_pin_buffer.outR
+                            }
+                            state.chain_plugins[chain_idx].mode = nil
+                        else
+                            state.chain_plugins[chain_idx].mode = MODE_NAMES[preset_index]
+                            state.chain_plugins[chain_idx].pin = nil
+                        end
+                    end
+                else
+                    notes_tags[state.editing_plugin_name] = notes_tags[state.editing_plugin_name] or {}
+                    if (preset_index == 13 or state.custom_pin_force_custom) then
+                        notes_tags[state.editing_plugin_name].pin = {
+                            inL = state.custom_pin_buffer.inL,
+                            inR = state.custom_pin_buffer.inR,
+                            outL = state.custom_pin_buffer.outL,
+                            outR = state.custom_pin_buffer.outR,
+                        }
+                    else
+                        notes_tags[state.editing_plugin_name].pin = {
+                            mode = MODE_NAMES[preset_index],
+                        }
+                    end
+                    save_table(NOTES_TAGS_FILE, notes_tags)
                 end
-                notes_tags[state.editing_plugin_name].pin = {
-                    inL = state.custom_pin_buffer.inL,
-                    inR = state.custom_pin_buffer.inR,
-                    outL = state.custom_pin_buffer.outL,
-                    outR = state.custom_pin_buffer.outR
-                }
-                save_table(NOTES_TAGS_FILE, notes_tags)
             end
-            r.ImGui_CloseCurrentPopup(ctx)
+            close_popup(ctx)
         end
         r.ImGui_SameLine(ctx)
         if r.ImGui_Button(ctx, "Reset to Global") then
-            if state.editing_plugin_name and notes_tags[state.editing_plugin_name] then
-                notes_tags[state.editing_plugin_name].pin = nil
-                save_table(NOTES_TAGS_FILE, notes_tags)
+            if state.editing_plugin_name then
+                if state.editing_chain_idx ~= nil then
+                    local chain_idx = state.editing_chain_idx + 1
+                    if state.chain_plugins[chain_idx] then
+                        state.chain_plugins[chain_idx].pin = nil
+                        state.chain_plugins[chain_idx].mode = nil
+                    end
+                else
+                    if notes_tags[state.editing_plugin_name] then
+                        notes_tags[state.editing_plugin_name].pin = nil
+                        save_table(NOTES_TAGS_FILE, notes_tags)
+                    end
+                end
             end
-            r.ImGui_CloseCurrentPopup(ctx)
+           close_popup(ctx)
         end
         r.ImGui_SameLine(ctx)
         if r.ImGui_Button(ctx, "Cancel") then
-            r.ImGui_CloseCurrentPopup(ctx)
+        state.editing_chain_idx = nil   -- <-- add this line
+            close_popup(ctx)
         end
         r.ImGui_EndPopup(ctx)
     end
 end
+-- rename pop up
+local function draw_chain_rename_popup()
+    if begin_centered_modal("Rename Chain Item", "chain_rename_popup_open") then
+        r.ImGui_Text(ctx, "Enter a temporary name for this chain item:")
+             
 
--- Note edit popup
+          focus()
+          reaper.ImGui_PushItemWidth(ctx, 255)
+        local changed, buf = r.ImGui_InputText(ctx, "##chain_rename_input", state.chain_rename_buffer, 256)
+         r.ImGui_TextDisabled(ctx, "This will be applied when you insert the plugin")
+        if changed then state.chain_rename_buffer = buf end
+        r.ImGui_Spacing(ctx)
+        if r.ImGui_Button(ctx, "Save") then
+            if state.chain_renaming_idx ~= nil then
+                local idx = state.chain_renaming_idx + 1
+                if state.chain_plugins[idx] then
+                    if state.chain_rename_buffer == "" then
+                        state.chain_plugins[idx].temp_name = nil   -- reset to original
+                    else
+                        state.chain_plugins[idx].temp_name = state.chain_rename_buffer
+                    end
+                end
+            end
+            state.chain_renaming_idx = nil
+            state.chain_rename_buffer = ""
+           
+           close_popup(ctx)
+        end
+        r.ImGui_SameLine(ctx)
+        if r.ImGui_Button(ctx, "Cancel") then
+            state.chain_renaming_idx = nil
+            state.chain_rename_buffer = ""
+                
+            close_popup(ctx)
+        end
+        r.ImGui_EndPopup(ctx)
+    end
+
+end
+local function draw_rename_popup()
+    if begin_centered_modal("Rename Plugin", "rename_popup_open") then
+        reaper.ImGui_PushItemWidth(ctx, 255)
+        r.ImGui_Text(ctx, "Enter a temporary display name:")
+   
+        focus()
+        local changed, buf = r.ImGui_InputText(ctx, "##rename_input", state.rename_buffer, 256 )
+             r.ImGui_TextDisabled(ctx, "This will be applied when you insert the plugin")
+        if changed then state.rename_buffer = buf end
+        r.ImGui_Spacing(ctx)
+        if r.ImGui_Button(ctx, "Save") then
+            if state.renaming_plugin and state.rename_buffer ~= "" then
+                state.temp_renames[state.renaming_plugin] = state.rename_buffer
+            end
+            state.renaming_plugin = nil
+            state.rename_buffer = ""
+   
+           close_popup(ctx)
+            
+        end
+        r.ImGui_SameLine(ctx)
+        if r.ImGui_Button(ctx, "Cancel") then
+            state.renaming_plugin = nil
+            state.rename_buffer = ""
+             close_popup(ctx)
+        end
+        r.ImGui_EndPopup(ctx)
+    end
+   
+end
+
 local function draw_note_popup()
     if state.note_edit_popup_open then
-     center_next_popup()
-        r.ImGui_OpenPopup(ctx, "Edit Note")
-        state.note_edit_popup_open = false
+        r.ImGui_SetNextWindowSize(ctx, 500, 300, r.ImGui_Cond_FirstUseEver())
+        r.ImGui_SetNextWindowSizeConstraints(ctx, 450, 200, 10000, 10000)
     end
-    if r.ImGui_BeginPopupModal(ctx, "Edit Note", nil, r.ImGui_WindowFlags_AlwaysAutoResize()) then
-        r.ImGui_Text(ctx, "Editing note for: " .. (state.editing_plugin_name or ""))
-        local changed, buf = r.ImGui_InputTextMultiline(ctx, "##noteinput", state.edit_buffer, 400, 150)
-        if changed then state.edit_buffer = buf end
+    if  begin_centered_modal("Add/Edit Note", "note_edit_popup_open") then
+        r.ImGui_Text(ctx,(state.editing_plugin_name or ""))
+           -- Scrollable text area (fills most of the window)
+             if r.ImGui_BeginChild(ctx, "note_scroll", 0, -r.ImGui_GetTextLineHeightWithSpacing(ctx) - 10, 0, 0) then
+               local flags = reaper.ImGui_InputTextFlags_CtrlEnterForNewLine()
+               focus()
+               local changed, buf = r.ImGui_InputTextMultiline(ctx, "##noteinput", state.edit_buffer, -1, -1, flags)
+               if changed then state.edit_buffer = buf end
+                 r.ImGui_EndChild(ctx)
+             end
+            r.ImGui_Spacing(ctx)
         if r.ImGui_Button(ctx, "Save") then
             if state.editing_plugin_name then
-                if not notes_tags[state.editing_plugin_name] then
-                    notes_tags[state.editing_plugin_name] = {}
-                end
+                notes_tags[state.editing_plugin_name] = notes_tags[state.editing_plugin_name] or {}
                 notes_tags[state.editing_plugin_name].note = state.edit_buffer
                 save_table(NOTES_TAGS_FILE, notes_tags)
             end
-            r.ImGui_CloseCurrentPopup(ctx)
+           close_popup(ctx)
         end
         r.ImGui_SameLine(ctx)
         if r.ImGui_Button(ctx, "Cancel") then
-            r.ImGui_CloseCurrentPopup(ctx)
+        close_popup(ctx)
         end
         r.ImGui_EndPopup(ctx)
     end
 end
 
--- Tag edit popup
 local function draw_tag_popup()
-    if state.tag_edit_popup_open then
-     center_next_popup()
-        r.ImGui_OpenPopup(ctx, "Edit Tags")
-        state.tag_edit_popup_open = false
-    end
-    if r.ImGui_BeginPopupModal(ctx, "Edit Tags", nil, r.ImGui_WindowFlags_AlwaysAutoResize()) then
+    if begin_centered_modal("Edit Tags", "tag_edit_popup_open") then
         r.ImGui_Text(ctx, "Enter tags (comma separated):")
-        local changed, buf = r.ImGui_InputText(ctx, "##taginput", state.edit_buffer, 300)
+        local flags = r.ImGui_InputTextFlags_None()
+        focus()
+        local changed, buf = r.ImGui_InputTextWithHint(ctx, "##taginput", "e.g., compressor, reverb", state.edit_buffer, flags)
         if changed then state.edit_buffer = buf end
+        r.ImGui_Spacing(ctx)
         if r.ImGui_Button(ctx, "Save") then
             if state.editing_plugin_name then
-                if not notes_tags[state.editing_plugin_name] then
-                    notes_tags[state.editing_plugin_name] = {}
-                end
-                local tags = {}
-                for tag in state.edit_buffer:gmatch("[^,]+") do
-                    tag = tag:match("^%s*(.-)%s*$")
-                    if tag ~= "" then tags[#tags+1] = tag end
-                end
-                notes_tags[state.editing_plugin_name].tags = tags
+                notes_tags[state.editing_plugin_name] = notes_tags[state.editing_plugin_name] or {}
+                notes_tags[state.editing_plugin_name].tags = split_csv(state.edit_buffer)
                 save_table(NOTES_TAGS_FILE, notes_tags)
             end
-            r.ImGui_CloseCurrentPopup(ctx)
+          close_popup(ctx)
         end
         r.ImGui_SameLine(ctx)
         if r.ImGui_Button(ctx, "Cancel") then
-            r.ImGui_CloseCurrentPopup(ctx)
+           close_popup(ctx)
         end
         r.ImGui_EndPopup(ctx)
     end
 end
 
--- Channel increase confirmation popup
 local function draw_confirmation_popup()
- center_next_popup()
-    if state.confirmation_data then
+ --[[   if state.confirmation_data and not state.confirmation_popup_open then
+        center_next_popup()
+        r.ImGui_SetNextWindowSize(ctx, 420, 300, r.ImGui_Cond_Once())
         r.ImGui_OpenPopup(ctx, "Confirm Channel Increase")
-    end
-    if r.ImGui_BeginPopupModal(ctx, "Confirm Channel Increase", nil, r.ImGui_WindowFlags_AlwaysAutoResize()) then
-        r.ImGui_Text(ctx, state.confirmation_data.message)
+        state.confirmation_popup_open = true
+    end ]] --
+    if begin_centered_modal("Confirm Channel Increase", "confirmation_popup_open") then
+        r.ImGui_Text(ctx, state.confirmation_data and state.confirmation_data.message or "")
         if r.ImGui_Button(ctx, "Yes") then
             local data = state.confirmation_data
             state.confirmation_data = nil
-            data.callback(true)
-            r.ImGui_CloseCurrentPopup(ctx)
+            state.confirmation_popup_open = false
+            if data then data.callback(true) end
+            close_popup(ctx)
         end
         r.ImGui_SameLine(ctx)
         if r.ImGui_Button(ctx, "No") then
             local data = state.confirmation_data
             state.confirmation_data = nil
-            data.callback(false)
-            r.ImGui_CloseCurrentPopup(ctx)
+            if data then data.callback(false) end
+           close_popup(ctx)
         end
         r.ImGui_EndPopup(ctx)
+    elseif not state.confirmation_data then
+        state.confirmation_popup_open = false
     end
 end
 
--- ----------------------------------------------------------------------
--- Header
--- ----------------------------------------------------------------------
-local function draw_header()
-    if r.ImGui_Button(ctx, "Refresh Data") then
-        folder_tree = parse_fx_folders()
-        if not find_folder_node(settings.go_to_folder_id) then
-            settings.go_to_folder_id = folder_tree[1] and folder_tree[1].guid or nil
+-- Parse a note into segments: plain text or link/file items
+local function get_note_segments(note_text)
+    if not note_text or note_text == "" then return {} end
+    local segments = {}
+    -- Pattern for link: <link URL @placeholder>
+    local pattern = "<link%s+([^%s@]+)%s+@([^>]+)>"
+    -- Also handle file links: <file PATH @placeholder>
+    local file_pattern = "<file%s+([^%s@]+)%s+@([^>]+)>"
+    local pos = 1
+    while true do
+        local start_link, end_link, link_url, link_placeholder = note_text:find(pattern, pos)
+        local start_file, end_file, file_url, file_placeholder = note_text:find(file_pattern, pos)
+        local start_idx, end_idx, url, placeholder, is_file = nil, nil, nil, nil, false
+        if start_link and (not start_file or start_link < start_file) then
+            start_idx, end_idx, url, placeholder = start_link, end_link, link_url, link_placeholder
+            is_file = false
+        elseif start_file then
+            start_idx, end_idx, url, placeholder = start_file, end_file, file_url, file_placeholder
+            is_file = true
+        else
+            break
         end
-        state.selected_folder_guid = settings.go_to_folder_id
+        if start_idx > pos then
+            segments[#segments + 1] = { type = "text", text = note_text:sub(pos, start_idx-1) }
+        end
+        if is_file then
+            segments[#segments + 1] = { type = "file", url = url, placeholder = placeholder }
+        else
+            segments[#segments + 1] = { type = "link", url = url, placeholder = placeholder }
+        end
+        pos = end_idx + 1
     end
-    r.ImGui_SetItemTooltip(ctx, "Reload folders from reaper-fxfolders.ini")
-    r.ImGui_SameLine(ctx)
+    if pos <= #note_text then
+        segments[#segments + 1] = { type = "text", text = note_text:sub(pos) }
+    end
+    return segments
+end
 
-    local mode = settings.pin_mode
-    local p = settings.pin_preset
-    local in_text, out_text
-    if mode == "Default" then
-        in_text = string.format("%d/%d", p.inL, p.inR)
-        out_text = string.format("%d/%d", p.outL, p.outR)
-    elseif mode == "SC→SC" then
-        in_text = "auto"; out_text = "auto"
-    elseif mode == "In→SC" then
-        in_text = string.format("%d/%d", p.inL, p.inR); out_text = "auto"
-    elseif mode == "SC→Out" then
-        in_text = "auto"; out_text = string.format("%d/%d", p.outL, p.outR)
-    elseif mode == "In→Left" then
-        in_text = string.format("%d/%d", p.inL, p.inR); out_text = string.format("%d/%d", p.outL, p.outR)
-    elseif mode == "In→Right" then
-        in_text = string.format("%d/%d", p.inL, p.inR); out_text = string.format("%d/%d", p.outL, p.outR)
-    elseif mode == "SC→Left" then
-        in_text = "auto"; out_text = string.format("%d/%d", p.outL, p.outR)
-    elseif mode == "SC→Right" then
-        in_text = "auto"; out_text = string.format("%d/%d", p.outL, p.outR)
-    elseif mode == "Left→Out" then
-        in_text = string.format("%d/%d", p.inL, p.inR); out_text = string.format("%d/%d", p.outL, p.outR)
-    elseif mode == "Right→Out" then
-        in_text = string.format("%d/%d", p.inL, p.inR); out_text = string.format("%d/%d", p.outL, p.outR)
-    elseif mode == "Left→SC" then
-        in_text = string.format("%d/%d", p.inL, p.inR); out_text = "auto"
-    elseif mode == "Right→SC" then
-        in_text = string.format("%d/%d", p.inL, p.inR); out_text = "auto"
-    elseif mode == "Custom" then
-        in_text = string.format("%d/%d", p.inL, p.inR)
-        out_text = string.format("%d/%d", p.outL, p.outR)
+-- Convert a raw note to a display string (removing tags, keeping placeholders)
+local function note_to_display_string(note_text)
+    if not note_text or note_text == "" then return "" end
+    local display = note_text
+    display = display:gsub("<link%s+[^%s@]+%s+@([^>]+)>", "%1")
+    display = display:gsub("<file%s+[^%s@]+%s+@([^>]+)>", "%1")
+    return display
+end
+local function draw_full_note_popup()
+--    if not state.full_note_popup_open then return end
+  --  center_next_popup()
+    r.ImGui_SetNextWindowSize(ctx, 500, 300, r.ImGui_Cond_FirstUseEver())
+    r.ImGui_SetNextWindowSizeConstraints(ctx, 350, 135, 900, 800)
+   -- r.ImGui_OpenPopup(ctx, "Full Note for " .. state.full_note_plugin)
+    if begin_centered_modal("Full Note for " .. state.full_note_plugin, "full_note_popup_open") then
+        if r.ImGui_BeginChild(ctx, "note_scroll", 0, -r.ImGui_GetTextLineHeightWithSpacing(ctx) - 10, 0, 0) then
+            local segments = get_note_segments(state.full_note_text)
+            local first = true
+            for _, seg in ipairs(segments) do
+                if seg.type == "text" then
+                    if not first then r.ImGui_SameLine(ctx) end
+                    r.ImGui_TextWrapped(ctx, seg.text)
+                    first = false
+                else
+                    if seg.type == "link" then
+                        local target = seg.url
+                        if not target:match("^https?://") then
+                            target = "http://" .. target
+                        end
+                   
+                        r.ImGui_TextLinkOpenURL(ctx, seg.placeholder, target)
+                        if r.ImGui_IsItemHovered(ctx) then
+                            r.ImGui_SetTooltip(ctx, target)
+                        end
+                        first = false
+                    else -- file
+                        -- Clean quotes from the raw path
+                        local raw_path = seg.url:gsub('^["\']', ''):gsub('["\']$', '')
+                        -- Normalize slashes and create file URL
+                        local target = raw_path:gsub("\\", "/")
+                        if not target:match("^file://") then
+                            target = "file:///" .. target
+                        end
+                      
+                        r.ImGui_TextLinkOpenURL(ctx, seg.placeholder, target)
+                        if r.ImGui_IsItemHovered(ctx) then
+                            -- Extract filename without quotes
+                            local cleaned = raw_path:gsub('^["\']', ''):gsub('["\']$', '')
+                            local filename = cleaned:match("[^\\/]+$") or seg.placeholder
+                            r.ImGui_SetTooltip(ctx, filename)
+                        end
+                        first = false
+                    end
+                end
+            end
+            r.ImGui_EndChild(ctx)
+        end
+        r.ImGui_Spacing(ctx)
+        if r.ImGui_Button(ctx, "Close") then
+         close_popup(ctx)
+        end
+        r.ImGui_EndPopup(ctx)
     else
-        in_text = "?"; out_text = "?"
+        state.full_note_popup_open = false
+    end
+end
+
+-- ======================================================================
+-- Chain helper functions
+-- ======================================================================
+
+
+
+local function build_chain_from_selection()
+    local plugins_in_order = {}
+    local selected_set = state.selected_plugins
+    local plugins = state.selected_folder_guid and get_folder_plugins(state.selected_folder_guid) or {}
+    local query = state.column3_search:lower()
+    local filtered_plugins = {}
+    for _, p in ipairs(plugins) do
+        local display_name = get_clean_name(p)
+        if query == "" or plain_find(display_name:lower(), query) or plain_find((p.name or ""):lower(), query) then
+            filtered_plugins[#filtered_plugins + 1] = p
+        end
+    end
+    for _, p in ipairs(filtered_plugins) do
+    if selected_set[p.name] then
+        local pin = nil
+        local mode = nil
+        local nt = notes_tags[p.name]
+        if nt and nt.pin then
+            if nt.pin.mode then
+                mode = nt.pin.mode
+            else
+                pin = {
+                    inL = nt.pin.inL,
+                    inR = nt.pin.inR,
+                    outL = nt.pin.outL,
+                    outR = nt.pin.outR,
+                }
+            end
+        end
+    
+        -- Create chain item
+        local chain_item = {
+            name = p.name,
+            display_name = get_clean_name(p),
+            pin = pin,
+            mode = mode,
+            temp_name = state.temp_renames[p.name],
+        }
+        -- If this is an FX chain, copy the special fields
+        if p.is_fxchain and p.chain_path then
+            chain_item.is_fxchain = true
+            chain_item.chain_path = p.chain_path
+        end
+        table.insert(plugins_in_order, chain_item)
+    end
+    end
+    return plugins_in_order
+end
+
+local function add_to_chain(plugins)
+    for _, p in ipairs(plugins) do
+        state.chain_plugins[#state.chain_plugins + 1] = p
     end
 
+end
+
+-- Get sorted list of selected indices (ascending)
+local function get_sorted_selected_chain_indices()
+    local indices = {}
+    for idx in pairs(state.chain_selected_set) do
+        indices[#indices + 1] = idx
+    end
+    table.sort(indices)
+    return indices
+end
+
+-- Adjust selection set when a single item moves from old_idx to new_idx (1‑based)
+local function adjust_selection_for_move(old_idx, new_idx)
+    if old_idx == new_idx then return end
+    local delta = new_idx > old_idx and -1 or 1   -- indices between shift by -1 or +1
+    local start, stop = math.min(old_idx, new_idx), math.max(old_idx, new_idx)
+    local new_selection = {}
+    for idx in pairs(state.chain_selected_set) do
+        if idx == old_idx then
+            new_selection[new_idx] = true
+        elseif idx >= start and idx <= stop and idx ~= old_idx then
+            new_selection[idx + delta] = true
+        else
+            new_selection[idx] = true
+        end
+    end
+    state.chain_selected_set = new_selection
+    -- Update last selected index if needed
+    if state.last_chain_selected_idx then
+        local last = state.last_chain_selected_idx
+        if last == old_idx then
+            state.last_chain_selected_idx = new_idx
+        elseif last >= start and last <= stop and last ~= old_idx then
+            state.last_chain_selected_idx = last + delta
+        end
+    end
+end
+
+-- Move all selected items up or down by delta (-1 or 1)
+local function move_selected_chain_items(delta)
+    local indices = get_sorted_selected_chain_indices()
+    if #indices == 0 then return end
+    if delta < 0 and indices[1] == 1 then return end
+    if delta > 0 and indices[#indices] == #state.chain_plugins then return end
+
+    -- Copy selected items to temporary list
+    local selected_items = {}
+    for _, idx in ipairs(indices) do
+        selected_items[#selected_items + 1] = state.chain_plugins[idx]
+    end
+
+    -- Remove selected items in reverse order
+    for i = #indices, 1, -1 do
+        table.remove(state.chain_plugins, indices[i])
+    end
+
+    -- Insert them at new positions
+    local new_base = indices[1] + delta
+    for i, item in ipairs(selected_items) do
+        table.insert(state.chain_plugins, new_base + i - 1, item)
+    end
+
+    -- Update selected set to new indices
+    state.chain_selected_set = {}
+    for i = 1, #selected_items do
+        state.chain_selected_set[new_base + i - 1] = true
+    end
+end
+
+-- Remove all selected items
+local function remove_selected_chain_items()
+    local indices = get_sorted_selected_chain_indices()
+    for i = #indices, 1, -1 do
+        table.remove(state.chain_plugins, indices[i])
+    end
+    state.chain_selected_set = {}
+    if #state.chain_plugins == 0 then
+        state.current_view = "plugins"
+    end
+end
+
+-- Reset pin for all selected items
+local function reset_selected_chain_pins()
+    for idx in pairs(state.chain_selected_set) do
+        if state.chain_plugins[idx] then
+            state.chain_plugins[idx].pin = nil
+            state.chain_plugins[idx].mode = nil
+        end
+    end
+end
+
+local function move_chain_item(idx, delta)   -- idx is 0‑based
+    local old_one_based = idx + 1
+    local new_one_based = idx + delta + 1
+    if new_one_based < 1 or new_one_based > #state.chain_plugins then return end
+    local item = state.chain_plugins[old_one_based]
+    table.remove(state.chain_plugins, old_one_based)
+    table.insert(state.chain_plugins, new_one_based, item)
+
+    -- Update selection set
+    adjust_selection_for_move(old_one_based, new_one_based)
+end
+
+
+local function clear_chain()
+    state.chain_plugins = {}
+
+    state.current_view = "plugins"   -- return to plugins view
+end
+
+
+local function save_chain_as_fxchain()
+    if #state.chain_plugins == 0 then
+        r.ShowMessageBox("Chain is empty.", "Save Chain", 0)
+        return
+    end
+    if not r.APIExists("JS_Dialog_BrowseForSaveFile") then
+        r.ShowMessageBox("js_ReaScriptAPI extension required for saving.", "Missing API", 0)
+        return
+    end
+    local retval, path = r.JS_Dialog_BrowseForSaveFile(
+        "Save FX Chain",
+        resource_path .. sep .. "FXChains",
+        "Chain",
+        "RfxChain file (*.RfxChain)\0*.RfxChain\0\0"
+    )
+    if not retval or path == "" then return end
+    if not path:lower():match("%.rfxchain$") then path = path .. ".RfxChain" end
+
+    -- Create a temporary track
+    local track_count = r.CountTracks(0)
+    r.InsertTrackAtIndex(track_count, true)
+    local tmp_track = r.GetTrack(0, track_count)
+    if not tmp_track then return end
+
+    -- Add items in order, expanding RFX chains
+    for _, item in ipairs(state.chain_plugins) do
+        if item.is_fxchain and item.chain_path then
+            local inner_chunk = read_chain_inner(item.chain_path)
+            if inner_chunk then
+                append_fx_chunk(tmp_track, inner_chunk)
+            else
+                r.ShowMessageBox("Could not read chain file: " .. item.chain_path, "Error", 0)
+            end
+        else
+            -- Regular plugin
+            local mode = item.mode or settings.pin_mode
+            local custom = item.pin or settings.pin_preset
+            local fx_idx = r.TrackFX_AddByName(tmp_track, item.name, false, -1)
+            if fx_idx >= 0 then
+                apply_pin_config(tmp_track, fx_idx, mode, custom, true)
+                local final_name = item.temp_name or state.temp_renames[item.name]
+                if final_name then
+                    r.TrackFX_SetNamedConfigParm(tmp_track, fx_idx, "renamed_name", final_name)
+                end
+            end
+        end
+    end
+
+    -- Extract the entire FX chain chunk from the temporary track
+    local _, chunk = r.GetTrackStateChunk(tmp_track, "", false)
+    local lines = {}
+    for line in chunk:gmatch("([^\n]*)\n?") do
+        lines[#lines + 1] = line
+    end
+    local start_idx, end_idx
+    for i = 1, #lines do
+        if lines[i]:find("<FXCHAIN") then
+            start_idx = i
+            break
+        end
+    end
+    for i = #lines, 1, -1 do
+        if lines[i]:match("^%s*>%s*$") then
+            end_idx = i
+            break
+        end
+    end
+    if not start_idx or not end_idx or start_idx >= end_idx then
+        r.ShowMessageBox("Could not extract FX chain block.", "Save Chain Error", 0)
+        r.DeleteTrack(tmp_track)
+        return
+    end
+    local inner_lines = {}
+    for i = start_idx + 1, end_idx - 1 do
+        inner_lines[#inner_lines + 1] = lines[i]
+    end
+    local fxchain = table.concat(inner_lines, "\n")
+
+    -- Write the file
+    local f = io.open(path, "w")
+    if f then
+        f:write(fxchain)
+        f:close()
+    else
+        r.ShowMessageBox("Could not write file.", "Save Chain Error", 0)
+    end
+    r.DeleteTrack(tmp_track)
+end
+-- ======================================================================
+-- Main UI
+-- ======================================================================
+-- draw header
+local function draw_header()
+  
     r.ImGui_SameLine(ctx)
+    
+    local target_names = "Track\0Take\0"
+    reaper.ImGui_PushItemWidth(ctx, 60)
+    local changed, new_target = r.ImGui_Combo(ctx, "##insert_target", state.insert_target, target_names)
+    if changed then
+        state.insert_target = new_target
+    end
+    r.ImGui_SameLine(ctx)
+    -- Target name display
+     local target_name = get_target_name(state.insert_target)
+     r.ImGui_Text(ctx, target_name)
+      local avail_w, avail_h = r.ImGui_GetContentRegionAvail(ctx)
+    r.ImGui_SameLine(ctx, (avail_w - 250))
+
+    local in_text, out_text = get_global_pin_text(settings.pin_mode, settings.pin_preset)
     r.ImGui_Text(ctx, "Global I/O:")
     r.ImGui_SameLine(ctx)
-    local button_label = string.format("%s → %s", in_text, out_text)
-
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), 0x00000000)
-    if r.ImGui_Button(ctx, button_label) then
+    set_style_button_transparent()
+    if r.ImGui_Button(ctx, string.format("%s → %s", in_text, out_text)) then
         state.pin_popup_open = true
     end
     r.ImGui_PopStyleColor(ctx)
     r.ImGui_SetItemTooltip(ctx, "Click to configure global pin routing")
-    r.ImGui_SameLine(ctx, 382)
-
-    if r.ImGui_Button(ctx, state.stay_open and "Stay Open: ON" or "Stay Open: OFF") then
-        state.stay_open = not state.stay_open
+  reaper.ImGui_SameLine(ctx)
+    -- Chain toggle
+    local chain_count = #state.chain_plugins
+    local toggle_label = (state.current_view == "plugins") and string.format("Chain (%d)", chain_count) or "Back to Plugins"
+    if r.ImGui_Button(ctx, toggle_label) then
+        if state.current_view == "plugins" then
+            if chain_count > 0 then
+                state.current_view = "chain"
+            else
+                r.ShowMessageBox("Chain is empty. Create a chain first by selecting plugins and using 'Create FX Chain from Selected'.", "Info", 0)
+            end
+        else
+            state.current_view = "plugins"
+        end
     end
-    r.ImGui_SetItemTooltip(ctx, "When ON, script stays open after inserting plugins. Ctrl+K toggles. Shift+Enter bypasses channel increase confirmation.")
-    r.ImGui_SameLine(ctx)
+    r.ImGui_SetItemTooltip(ctx, state.current_view == "plugins" and "Show FX Chain" or "Back to folder plugins")
+        r.ImGui_SetItemTooltip(ctx, "Insert plugins to:\n- Track: regular track FX\n- Take: active take of selected item\n- No item = fallback to track")
+     r.ImGui_SameLine(ctx, avail_w - 16)
+    if r.ImGui_Button(ctx, "☰") then
+          r.ImGui_OpenPopup(ctx, "HeaderMenu")
+      end
+      r.ImGui_SetItemTooltip(ctx, "Menu")
+    
+      if r.ImGui_BeginPopup(ctx, "HeaderMenu") then
+          if r.ImGui_Selectable(ctx, "Refresh Data") then
+              folder_tree = parse_fx_folders()
+              if not find_folder_node(settings.go_to_folder_id) then
+                  settings.go_to_folder_id = folder_tree[1] and folder_tree[1].guid or nil
+              end
+              state.selected_folder_guid = settings.go_to_folder_id
+          end
+           r.ImGui_SetItemTooltip(ctx, "Reload folders from reaper-fxfolders.ini")
+          r.ImGui_Separator(ctx)
+          if r.ImGui_Selectable(ctx, state.stay_open and "Stay Open: ON" or "Stay Open: OFF") then
+              state.stay_open = not state.stay_open
+          end
+           r.ImGui_SetItemTooltip(ctx, "Ctrl + K shortcut.\nKeep script open on insert")
+          r.ImGui_Separator(ctx)
+          if r.ImGui_Selectable(ctx, "Help") then
+              r.ImGui_OpenPopup(ctx, "Help")
+              if r.ImGui_BeginPopup(ctx, "Help") then
+                  r.ImGui_Text(ctx, "Keyboard Shortcuts:")
+                  r.ImGui_BulletText(ctx, "Enter: Insert selected plugin(s)")
+                  r.ImGui_BulletText(ctx, "Shift+Enter: Insert without channel increase")
+                  r.ImGui_BulletText(ctx, "Ctrl+K: Toggle Stay Open")
+                  r.ImGui_BulletText(ctx, "Ctrl+F: Focus folder search")
+                  r.ImGui_BulletText(ctx, "Ctrl+Shift+C: Create chain from selected")
+                  r.ImGui_BulletText(ctx, "Ctrl+Shift+X: Switch to chain view (if non‑empty)")
+                  r.ImGui_BulletText(ctx, "Delete: Remove selected chain item")
+                  r.ImGui_Separator(ctx)
+                  r.ImGui_Text(ctx, "Pin Modes:")
+                  for _, name in ipairs(MODE_NAMES) do
+                      r.ImGui_BulletText(ctx, name .. ": " .. MODE_DESCRIPTIONS[name])
+                  end
+                  r.ImGui_EndPopup(ctx)
+              end
+              
+          end
+          r.ImGui_EndPopup(ctx)
+      end
+    
 end
 
--- ----------------------------------------------------------------------
--- Column 2: Folders
--- ----------------------------------------------------------------------
+-- draw chain
+local function draw_chain_list()
+    r.ImGui_Separator(ctx)
+
+    -- Buttons row
+    if r.ImGui_Button(ctx, "Insert Chain") then
+        local chain = state.chain_plugins
+        if #chain > 0 then
+            if has_fxchain(chain) then
+                add_chain_to_track(chain, false)
+            else
+                add_plugins_with_configs(chain, false)
+            end
+        end
+    end
+    r.ImGui_SetItemTooltip(ctx, "Insert the chain into the selected track (creates new track if none)")
+    r.ImGui_SameLine(ctx)
+    if r.ImGui_Button(ctx, "Save as FX Chain") then
+        save_chain_as_fxchain()
+    end
+    r.ImGui_SameLine(ctx)
+    if r.ImGui_Button(ctx, "Clear Chain") then
+        clear_chain()
+    end
+    r.ImGui_SameLine(ctx)
+    if r.ImGui_Button(ctx, "Reset to Global") then
+        for _, item in ipairs(state.chain_plugins) do
+            item.pin = nil
+            item.mode = nil
+        end
+    end
+    r.ImGui_SetItemTooltip(ctx, "Reset all chain items to global pin configuration")
+    r.ImGui_Separator(ctx)
+
+    -- Chain table
+    if #state.chain_plugins == 0 then
+        r.ImGui_Text(ctx, "Chain is empty. Select plugins and use 'Create FX Chain from Selected'.")
+        return
+    end
+
+    local col_flags = r.ImGui_TableFlags_Resizable() | r.ImGui_TableFlags_Borders()
+    if r.ImGui_BeginTable(ctx, "chain_table", 3, col_flags) then
+        r.ImGui_TableSetupColumn(ctx, "Order", r.ImGui_TableColumnFlags_WidthFixed(), 50)
+        r.ImGui_TableSetupColumn(ctx, "Name", r.ImGui_TableColumnFlags_WidthStretch(), 200)
+        r.ImGui_TableSetupColumn(ctx, "Pins", r.ImGui_TableColumnFlags_WidthFixed(), 100)
+        r.ImGui_TableHeadersRow(ctx)
+
+        for idx, item in ipairs(state.chain_plugins) do
+            r.ImGui_TableNextRow(ctx)
+            r.ImGui_PushID(ctx, idx)
+
+            -- Order column (up/down)
+            r.ImGui_TableSetColumnIndex(ctx, 0)
+            local up_enabled = idx > 1
+            local down_enabled = idx < #state.chain_plugins
+            if up_enabled then
+                if r.ImGui_ArrowButton(ctx, "up", r.ImGui_Dir_Up()) then
+                    if state.chain_selected_set[idx] then
+                        move_selected_chain_items(-1)
+                    else
+                        move_chain_item(idx - 1, -1)
+                    end
+                end
+                r.ImGui_SameLine(ctx)
+            else
+                r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_Alpha(), 0.5)
+                r.ImGui_ArrowButton(ctx, "up_disabled", r.ImGui_Dir_Up())
+                r.ImGui_PopStyleVar(ctx)
+                r.ImGui_SameLine(ctx)
+            end
+            if down_enabled then
+                if r.ImGui_ArrowButton(ctx, "down", r.ImGui_Dir_Down()) then
+                    if state.chain_selected_set[idx] then
+                        move_selected_chain_items(1)
+                    else
+                        move_chain_item(idx - 1, 1)
+                    end
+                end
+            else
+                r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_Alpha(), 0.5)
+                r.ImGui_ArrowButton(ctx, "down_disabled", r.ImGui_Dir_Down())
+                r.ImGui_PopStyleVar(ctx)
+            end
+
+            -- Name column (selectable)
+            r.ImGui_TableSetColumnIndex(ctx, 1)
+            local display_name = item.temp_name or item.display_name
+            local is_selected = state.chain_selected_set[idx]
+            if r.ImGui_Selectable(ctx, display_name, is_selected, 0) then
+                local mods = r.ImGui_GetKeyMods(ctx)
+                local ctrl = (mods & r.ImGui_Mod_Ctrl()) ~= 0
+                local shift = (mods & r.ImGui_Mod_Shift()) ~= 0
+                select_chain_item(idx, state.chain_plugins, mods, shift, ctrl)
+            end
+
+            -- Name column: double-click → rename
+            if r.ImGui_IsItemHovered(ctx) and r.ImGui_IsMouseDoubleClicked(ctx, 0) then
+                state.chain_renaming_idx = idx - 1
+                state.chain_rename_buffer = item.temp_name or item.display_name
+                state.chain_rename_popup_open = true
+            end
+
+            -- Name column: context menu
+            if r.ImGui_BeginPopupContextItem(ctx) then
+                if r.ImGui_Selectable(ctx, "Remove from Chain") then
+                    local selected_indices = get_sorted_selected_chain_indices()
+                    local to_remove = {}
+                    for _, i in ipairs(selected_indices) do
+                        to_remove[i] = true
+                    end
+                    if not to_remove[idx] then
+                        to_remove[idx] = true
+                    end
+                    for i = #state.chain_plugins, 1, -1 do
+                        if to_remove[i] then
+                            table.remove(state.chain_plugins, i)
+                        end
+                    end
+                    state.chain_selected_set = {}
+                    if #state.chain_plugins == 0 then
+                        state.current_view = "plugins"
+                    end
+                end
+                if r.ImGui_Selectable(ctx, "Reset to Global") then
+                    reset_selected_chain_pins()
+                end
+                if r.ImGui_Selectable(ctx, "Rename") then
+                    state.chain_renaming_idx = idx - 1
+                    state.chain_rename_buffer = item.temp_name or item.display_name
+                    state.chain_rename_popup_open = true
+                end
+                r.ImGui_EndPopup(ctx)
+            end
+
+            -- Pins column (selectable, same selection logic)
+            r.ImGui_TableSetColumnIndex(ctx, 2)
+            r.ImGui_PushID(ctx, "pins" .. idx)   -- separate ID for Pins column
+            local pin_label
+            if item.is_fxchain then
+                pin_label = "CHAIN"
+            else
+                local pin_config = nil
+                if item.mode then
+                    pin_config = { mode = item.mode }
+                elseif item.pin then
+                    pin_config = item.pin
+                end
+                pin_label = pin_config and format_pin_display(pin_config, false) or format_pin_display(nil, true)
+            end
+            if r.ImGui_Selectable(ctx, pin_label, is_selected, 0) then
+                local mods = r.ImGui_GetKeyMods(ctx)
+                local ctrl = (mods & r.ImGui_Mod_Ctrl()) ~= 0
+                local shift = (mods & r.ImGui_Mod_Shift()) ~= 0
+                select_chain_item(idx, state.chain_plugins, mods, shift, ctrl)
+            end
+
+            -- Tooltip
+            if r.ImGui_IsItemHovered(ctx) then
+                if item.is_fxchain then
+                    r.ImGui_BeginTooltip(ctx)
+                    r.ImGui_PushTextWrapPos(ctx, 300)
+                    r.ImGui_Text(ctx, "FX Chain – cannot be edited.\nDouble‑click does nothing.")
+                    r.ImGui_PopTextWrapPos(ctx)
+                    r.ImGui_EndTooltip(ctx)
+                else
+                    local pin_config = item.mode and { mode = item.mode } or (item.pin and item.pin or nil)
+                    if pin_config then
+                        if pin_config.mode then
+                            r.ImGui_BeginTooltip(ctx)
+                            r.ImGui_PushTextWrapPos(ctx, 300)
+                            r.ImGui_Text(ctx, "Mode: " .. pin_config.mode)
+                            r.ImGui_Text(ctx, "Double‑click to edit")
+                            r.ImGui_PopTextWrapPos(ctx)
+                            r.ImGui_EndTooltip(ctx)
+                        else
+                            r.ImGui_BeginTooltip(ctx)
+                            r.ImGui_PushTextWrapPos(ctx, 300)
+                            r.ImGui_Text(ctx, string.format("In: %d/%d Out: %d/%d", pin_config.inL, pin_config.inR, pin_config.outL, pin_config.outR))
+                            r.ImGui_Text(ctx, "Double‑click to edit")
+                            r.ImGui_PopTextWrapPos(ctx)
+                            r.ImGui_EndTooltip(ctx)
+                        end
+                    else
+                        r.ImGui_BeginTooltip(ctx)
+                        r.ImGui_PushTextWrapPos(ctx, 300)
+                        r.ImGui_Text(ctx, "Global (will follow global mode)")
+                        r.ImGui_Text(ctx, "Double‑click to set custom")
+                        r.ImGui_PopTextWrapPos(ctx)
+                        r.ImGui_EndTooltip(ctx)
+                    end
+                end
+            end
+
+            -- Pins column: double-click → custom pin editor (non-chain only)
+            if not item.is_fxchain and r.ImGui_IsItemHovered(ctx) and r.ImGui_IsMouseDoubleClicked(ctx, 0) then
+                state.editing_plugin_name = item.name
+                state.editing_chain_idx = idx - 1
+                if item.mode then
+                    state.custom_pin_mode = item.mode
+                    local preset = get_mode_preset(item.mode)
+                    state.custom_pin_buffer = { inL = preset.inL, inR = preset.inR, outL = preset.outL, outR = preset.outR }
+                    state.custom_pin_force_custom = false
+                elseif item.pin then
+                    state.custom_pin_mode = nil
+                    state.custom_pin_buffer = {
+                        inL = item.pin.inL,
+                        inR = item.pin.inR,
+                        outL = item.pin.outL,
+                        outR = item.pin.outR
+                    }
+                    state.custom_pin_force_custom = true
+                else
+                    state.custom_pin_mode = nil
+                    state.custom_pin_buffer = { inL = settings.pin_preset.inL, inR = settings.pin_preset.inR, outL = settings.pin_preset.outL, outR = settings.pin_preset.outR }
+                    state.custom_pin_force_custom = false
+                end
+                state.custom_pin_popup_open = true
+            end
+
+            -- Pins column: context menu (same options as Name column)
+            if r.ImGui_BeginPopupContextItem(ctx) then
+                if r.ImGui_Selectable(ctx, "Remove from Chain") then
+                    local selected_indices = get_sorted_selected_chain_indices()
+                    local to_remove = {}
+                    for _, i in ipairs(selected_indices) do
+                        to_remove[i] = true
+                    end
+                    if not to_remove[idx] then
+                        to_remove[idx] = true
+                    end
+                    for i = #state.chain_plugins, 1, -1 do
+                        if to_remove[i] then
+                            table.remove(state.chain_plugins, i)
+                        end
+                    end
+                    state.chain_selected_set = {}
+                    if #state.chain_plugins == 0 then
+                        state.current_view = "plugins"
+                    end
+                end
+                if r.ImGui_Selectable(ctx, "Reset to Global") then
+                    reset_selected_chain_pins()
+                end
+                if r.ImGui_Selectable(ctx, "Rename") then
+                    state.chain_renaming_idx = idx - 1
+                    state.chain_rename_buffer = item.temp_name or item.display_name
+                    state.chain_rename_popup_open = true
+                end
+                r.ImGui_EndPopup(ctx)
+            end
+
+            r.ImGui_PopID(ctx)   -- pop for Pins column ID
+            r.ImGui_PopID(ctx)   -- pop for row ID
+        end
+        r.ImGui_EndTable(ctx)
+    end
+end
+
 local function draw_column2()
     r.ImGui_PushItemWidth(ctx, -1)
+    
     local changed, newval = r.ImGui_InputText(ctx, "##col2search", state.column2_search)
     if changed then state.column2_search = newval end
     r.ImGui_PopItemWidth(ctx)
     r.ImGui_Separator(ctx)
 
     if r.ImGui_BeginChild(ctx, "col2_list") then
+        local query = state.column2_search:lower()
         for _, node in ipairs(folder_tree) do
-            local name_matches = state.column2_search == "" or node.name:lower():match(state.column2_search:lower())
-            if name_matches or state.column2_search == "" then
+            if query == "" or plain_find(node.name:lower(), query) then
                 r.ImGui_PushID(ctx, node.guid)
                 local is_selected = (state.selected_folder_guid == node.guid)
                 if r.ImGui_Selectable(ctx, node.name, is_selected) then
                     state.selected_folder_guid = node.guid
+                      state.current_view = "plugins"   -- switch to plugins view
+                      state.first_run = true
+                       state.custom_select = false
                 end
                 if r.ImGui_BeginPopupContextItem(ctx) then
                     if r.ImGui_Selectable(ctx, "Set as Go‑to Folder") then
@@ -1072,132 +2530,165 @@ local function draw_column2()
     end
 end
 
--- ----------------------------------------------------------------------
--- Column 3: Plugin list with pins, sorting, tag filter
--- ----------------------------------------------------------------------
-local function draw_column3()
-    r.ImGui_PushItemWidth(ctx, -1)
+local function folder_passes_tag_filter(plugin_name)
+    if next(state.tag_filter) == nil then return true end
+    local nt = notes_tags[plugin_name] or {}
+    if not nt.tags then return false end
+    for filter_tag in pairs(state.tag_filter) do
+        for _, t in ipairs(nt.tags) do
+            if t == filter_tag then return true end
+        end
+    end
+    return false
+end
 
-    -- Search bar
+local function count_selected()
+        local selected_names = {}
+        for name in pairs(state.selected_plugins) do selected_names[#selected_names + 1] = name end
+return #selected_names
+end
+-- draw plugins
+local function draw_plugins_list()
+    if state.first_run  then
+        r.ImGui_SetKeyboardFocusHere(ctx, 0)   -- focuses first input widget (column 3 search)
+    
+    end
+    r.ImGui_PushItemWidth(ctx, (reaper.ImGui_GetWindowWidth(ctx)*0.58))
     local changed, newval = r.ImGui_InputText(ctx, "##col3search", state.column3_search)
     if changed then state.column3_search = newval end
     r.ImGui_SameLine(ctx)
+ local filter_active = next(state.tag_filter) ~= nil
+   if filter_active then
+       r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), 0xBB401ADF)  -- bright green with alpha
+   end
     if r.ImGui_Button(ctx, "Tag Filter") then
         r.ImGui_OpenPopup(ctx, "TagFilterPopup")
     end
+    if filter_active then
+        r.ImGui_PopStyleColor(ctx)
+    end
     r.ImGui_PopItemWidth(ctx)
 
-    -- Tag filter popup
-    if r.ImGui_BeginPopup(ctx, "TagFilterPopup") then
-        r.ImGui_Text(ctx, "Filter by tag (check to include):")
-        r.ImGui_Separator(ctx)
-        local all_tags = get_all_tags()
-        local changed_filter = false
-        for _, tag in ipairs(all_tags) do
-            local checked = state.tag_filter[tag] or false
-            local clicked, new_checked = r.ImGui_Checkbox(ctx, tag, checked)
-            if clicked then
-                if new_checked then
-                    state.tag_filter[tag] = true
-                else
-                    state.tag_filter[tag] = nil
-                end
-                changed_filter = true
-            end
-        end
-        r.ImGui_Separator(ctx)
-        if r.ImGui_Button(ctx, "Clear All") then
-            state.tag_filter = {}
-            changed_filter = true
-            r.ImGui_CloseCurrentPopup(ctx)
-        end
-        r.ImGui_SameLine(ctx)
-        if r.ImGui_Button(ctx, "Close") then
-            r.ImGui_CloseCurrentPopup(ctx)
-        end
-        if changed_filter then end
-        r.ImGui_EndPopup(ctx)
-    end
+   if r.ImGui_BeginPopup(ctx, "TagFilterPopup") then
+       r.ImGui_Text(ctx, "Filter by tag (check to include):")
+       r.ImGui_Separator(ctx)
+       local folder_tags = get_tags_in_folder(state.selected_folder_guid)
+       for _, tag in ipairs(folder_tags) do
+           local checked = state.tag_filter[tag] or false
+           local clicked, new_checked = r.ImGui_Checkbox(ctx, tag, checked)
+           if clicked then
+               if new_checked then state.tag_filter[tag] = true else state.tag_filter[tag] = nil end
+           end
+       end
+       r.ImGui_Separator(ctx)
+       if r.ImGui_Button(ctx, "Clear All") then
+           state.tag_filter = {}
+           r.ImGui_CloseCurrentPopup(ctx)
+       end
+       r.ImGui_SameLine(ctx)
+       if r.ImGui_Button(ctx, "Close") then
+           r.ImGui_CloseCurrentPopup(ctx)
+       end
+       r.ImGui_EndPopup(ctx)
+   end
 
     local plugins = state.selected_folder_guid and get_folder_plugins(state.selected_folder_guid) or {}
-    local search_pat = state.column3_search:lower()
+    local query = state.column3_search:lower()
     local filtered = {}
     for _, p in ipairs(plugins) do
-        local stripped = get_clean_name(p)
-        if search_pat == "" or stripped:lower():match(search_pat) or p.name:lower():match(search_pat) then
-            local nt = notes_tags[p.name] or {}
-            local passes_tag = true
-            if next(state.tag_filter) ~= nil then
-                passes_tag = false
-                if nt.tags then
-                    for tag in pairs(state.tag_filter) do
-                        for _, t in ipairs(nt.tags) do
-                            if t == tag then passes_tag = true; break end
-                        end
-                        if passes_tag then break end
-                    end
-                end
-            end
-            if passes_tag then
-                table.insert(filtered, p)
-            end
+        local display_name = get_clean_name(p)
+        local match_search = query == "" or plain_find(display_name:lower(), query) or plain_find((p.name or ""):lower(), query)
+        if match_search and folder_passes_tag_filter(p.name) then
+            filtered[#filtered + 1] = p
         end
     end
 
-    -- Sorting
-    if settings.sort_column and settings.sort_ascending ~= nil then
-        table.sort(filtered, function(a, b)
-            local va, vb
-            if settings.sort_column == 0 then
-                va = get_clean_name(a); vb = get_clean_name(b)
-            elseif settings.sort_column == 1 then
-                va = a.type; vb = b.type
-            elseif settings.sort_column == 2 then
-                va = a.developer; vb = b.developer
-            elseif settings.sort_column == 3 then
-                local nta = notes_tags[a.name] or {}; local ntb = notes_tags[b.name] or {}
-                va = (nta.tags and table.concat(nta.tags, ", ")) or ""
-                vb = (ntb.tags and table.concat(ntb.tags, ", ")) or ""
-            else
-                va = a.name; vb = b.name
-            end
-            va = va or ""; vb = vb or ""
-            if settings.sort_ascending then
-                return va:lower() < vb:lower()
-            else
-                return va:lower() > vb:lower()
-            end
-        end)
-    end
+    -- Sort visible list
+    table.sort(filtered, function(a, b)
+        local va, vb
+        if settings.sort_column == 0 then
+            va = get_clean_name(a)
+            vb = get_clean_name(b)
+        elseif settings.sort_column == 1 then
+            va = a.type
+            vb = b.type
+        elseif settings.sort_column == 2 then
+            va = a.developer
+            vb = b.developer
+        elseif settings.sort_column == 3 then
+            local nta = notes_tags[a.name] or {}
+            local ntb = notes_tags[b.name] or {}
+            va = (nta.tags and table.concat(nta.tags, ", ")) or ""
+            vb = (ntb.tags and table.concat(ntb.tags, ", ")) or ""
+        else
+            va = a.name
+            vb = b.name
+        end
+        va = tostring(va or ""):lower()
+        vb = tostring(vb or ""):lower()
+        if settings.sort_ascending then return va < vb else return va > vb end
+    end)
 
-    local col_flags = r.ImGui_TableFlags_Resizable() | r.ImGui_TableFlags_Borders()
+    -- Auto‑select first plugin only on initial startup
+    if (state.first_run or changed)  then
+        state.first_run = false
+        if #filtered > 0  and state.custom_select == false then
+            state.selected_plugins = {}
+            local first = filtered[1]
+            state.selected_plugins = { [first.name] = true }
+            state.last_clicked_index = 1
+            
+        end
+    end
+    
+    local col_flags = r.ImGui_TableFlags_Resizable() | r.ImGui_TableFlags_Borders() 
     if r.ImGui_BeginTable(ctx, "col3table", 5, col_flags) then
+            r.ImGui_TableSetupColumn(ctx, "Type", r.ImGui_TableColumnFlags_WidthFixed() | r.ImGui_TableColumnFlags_NoResize() , 40)
         r.ImGui_TableSetupColumn(ctx, "Name", r.ImGui_TableColumnFlags_WidthFixed(), 150)
-        r.ImGui_TableSetupColumn(ctx, "Type", r.ImGui_TableColumnFlags_WidthFixed(), 80)
         r.ImGui_TableSetupColumn(ctx, "Developer", r.ImGui_TableColumnFlags_WidthFixed(), 100)
         r.ImGui_TableSetupColumn(ctx, "Tags", r.ImGui_TableColumnFlags_WidthFixed(), 120)
         r.ImGui_TableSetupColumn(ctx, "Pins", r.ImGui_TableColumnFlags_WidthStretch(), 80)
         r.ImGui_TableHeadersRow(ctx)
-
         for i, p in ipairs(filtered) do
-            r.ImGui_TableNextRow(ctx)
             local nt = notes_tags[p.name] or {}
             local tags_str = nt.tags and table.concat(nt.tags, ", ") or ""
             local display_name = get_clean_name(p)
 
-            -- Name column
-            r.ImGui_TableSetColumnIndex(ctx, 0)
+            r.ImGui_TableNextRow(ctx)
+     -- Type column
+     r.ImGui_TableSetColumnIndex(ctx, 0)
+     r.ImGui_PushID(ctx, "type" .. i)
+     if r.ImGui_Selectable(ctx, p.type, state.selected_plugins[p.name] or false) then
+         local mods = r.ImGui_GetKeyMods(ctx)
+         local ctrl = (mods & r.ImGui_Mod_Ctrl()) ~= 0
+         local shift = (mods & r.ImGui_Mod_Shift()) ~= 0
+         select_plugin(p.name, i, filtered, mods, shift, ctrl)
+     end
+     if r.ImGui_BeginPopupContextItem(ctx) then
+         if r.ImGui_Selectable(ctx, "Sort Type Ascending") then
+             settings.sort_column = 1; settings.sort_ascending = true
+         end
+         if r.ImGui_Selectable(ctx, "Sort Type Descending") then
+             settings.sort_column = 1; settings.sort_ascending = false
+         end
+         r.ImGui_EndPopup(ctx)
+     end
+     r.ImGui_PopID(ctx)
+            -- Name column (selectable)
+            r.ImGui_TableSetColumnIndex(ctx, 1)
             local selected = state.selected_plugins[p.name] or false
+            if reaper.ImGui_IsItemClicked(ctx) then state.custom_select = true end
             if r.ImGui_Selectable(ctx, display_name, selected) then
+                -- Clear chain selection
+           
+                state.chain_selected_idx = nil
                 local mods = r.ImGui_GetKeyMods(ctx)
                 if mods & r.ImGui_Mod_Ctrl() ~= 0 then
                     if selected then state.selected_plugins[p.name] = nil else state.selected_plugins[p.name] = true end
                 elseif mods & r.ImGui_Mod_Shift() ~= 0 and state.last_clicked_index then
                     local start_i, end_i = math.min(state.last_clicked_index, i), math.max(state.last_clicked_index, i)
                     state.selected_plugins = {}
-                    for j = start_i, end_i do
-                        state.selected_plugins[filtered[j].name] = true
-                    end
+                    for j = start_i, end_i do state.selected_plugins[filtered[j].name] = true end
                 else
                     state.selected_plugins = { [p.name] = true }
                     state.last_clicked_index = i
@@ -1205,15 +2696,21 @@ local function draw_column3()
             end
 
             if r.ImGui_BeginPopupContextItem(ctx) then
-                if r.ImGui_Selectable(ctx, "Edit Note") then
-                    state.editing_plugin_name = p.name
-                    state.edit_buffer = nt.note or ""
-                    state.note_edit_popup_open = true
+            if r.ImGui_Selectable(ctx, "Edit Note") then
+              state.editing_plugin_name = p.name
+                     state.edit_buffer = nt.note or ""
+                     state.note_edit_popup_open = true
+            end
+              
+                if r.ImGui_Selectable(ctx, "Rename") then
+                    state.renaming_plugin = p.name
+                    state.rename_buffer = get_clean_name(p)   -- current displayed name
+                    state.rename_popup_open = true
                 end
-                if r.ImGui_Selectable(ctx, "Edit Tags") then
-                    state.editing_plugin_name = p.name
-                    state.edit_buffer = tags_str
-                    state.tag_edit_popup_open = true
+                if  state.temp_renames[p.name] ~= nil then 
+                if r.ImGui_Selectable(ctx, "Reset Name") then
+                    state.temp_renames[p.name] = nil
+                end
                 end
                 if r.ImGui_Selectable(ctx, "Sort Name Ascending") then
                     settings.sort_column = 0; settings.sort_ascending = true
@@ -1221,134 +2718,250 @@ local function draw_column3()
                 if r.ImGui_Selectable(ctx, "Sort Name Descending") then
                     settings.sort_column = 0; settings.sort_ascending = false
                 end
-                r.ImGui_EndPopup(ctx)
-            end
+                -- Chain creation
 
-            -- Type column
-            r.ImGui_TableSetColumnIndex(ctx, 1)
-            r.ImGui_PushID(ctx, "type" .. i)
-            if r.ImGui_Selectable(ctx, p.type, false) then end
-            if r.ImGui_BeginPopupContextItem(ctx) then
-                if r.ImGui_Selectable(ctx, "Sort Type Ascending") then
-                    settings.sort_column = 1; settings.sort_ascending = true
-                end
-                if r.ImGui_Selectable(ctx, "Sort Type Descending") then
-                    settings.sort_column = 1; settings.sort_ascending = false
+        if count_selected() > 0 then
+                    if r.ImGui_Selectable(ctx, "Add selected to FX Chain") then
+                        local chain = build_chain_from_selection()
+                        --clear_chain()
+                        add_to_chain(chain)
+                    end
                 end
                 r.ImGui_EndPopup(ctx)
             end
-            r.ImGui_PopID(ctx)
+            
+               if r.ImGui_IsItemHovered(ctx) and r.ImGui_IsMouseDoubleClicked(ctx, 0) then
+               state.renaming_plugin = p.name
+               state.rename_buffer = get_clean_name(p)   -- current displayed name
+               state.rename_popup_open = true
+               end
 
-            -- Developer column
-            r.ImGui_TableSetColumnIndex(ctx, 2)
-            r.ImGui_PushID(ctx, "dev" .. i)
-            if r.ImGui_Selectable(ctx, p.developer, false) then end
-            if r.ImGui_BeginPopupContextItem(ctx) then
-                if r.ImGui_Selectable(ctx, "Sort Developer Ascending") then
-                    settings.sort_column = 2; settings.sort_ascending = true
-                end
-                if r.ImGui_Selectable(ctx, "Sort Developer Descending") then
-                    settings.sort_column = 2; settings.sort_ascending = false
-                end
-                r.ImGui_EndPopup(ctx)
-            end
-            r.ImGui_PopID(ctx)
+         
 
-            -- Tags column
-            r.ImGui_TableSetColumnIndex(ctx, 3)
-            r.ImGui_PushID(ctx, "tags" .. i)
-            if r.ImGui_Selectable(ctx, tags_str, false) then end
-            if r.ImGui_BeginPopupContextItem(ctx) then
-                if r.ImGui_Selectable(ctx, "Sort Tags Ascending") then
-                    settings.sort_column = 3; settings.sort_ascending = true
-                end
-                if r.ImGui_Selectable(ctx, "Sort Tags Descending") then
-                    settings.sort_column = 3; settings.sort_ascending = false
-                end
-                r.ImGui_EndPopup(ctx)
-            end
-            r.ImGui_PopID(ctx)
+          -- Developer column
+          r.ImGui_TableSetColumnIndex(ctx, 2)
+          r.ImGui_PushID(ctx, "dev" .. i)
+          if r.ImGui_Selectable(ctx, p.developer, state.selected_plugins[p.name] or false) then
+              local mods = r.ImGui_GetKeyMods(ctx)
+              local ctrl = (mods & r.ImGui_Mod_Ctrl()) ~= 0
+              local shift = (mods & r.ImGui_Mod_Shift()) ~= 0
+              select_plugin(p.name, i, filtered, mods, shift, ctrl)
+          end
+          if r.ImGui_BeginPopupContextItem(ctx) then
+              if r.ImGui_Selectable(ctx, "Sort Developer Ascending") then
+                  settings.sort_column = 2; settings.sort_ascending = true
+              end
+              if r.ImGui_Selectable(ctx, "Sort Developer Descending") then
+                  settings.sort_column = 2; settings.sort_ascending = false
+              end
+              r.ImGui_EndPopup(ctx)
+          end
+          r.ImGui_PopID(ctx)
+
+         -- Tags column
+         r.ImGui_TableSetColumnIndex(ctx, 3)
+         r.ImGui_PushID(ctx, "tags" .. i)
+         if r.ImGui_Selectable(ctx, tags_str, state.selected_plugins[p.name] or false) then
+             local mods = r.ImGui_GetKeyMods(ctx)
+             local ctrl = (mods & r.ImGui_Mod_Ctrl()) ~= 0
+             local shift = (mods & r.ImGui_Mod_Shift()) ~= 0
+             select_plugin(p.name, i, filtered, mods, shift, ctrl)
+         end
+         if r.ImGui_BeginPopupContextItem(ctx) then
+         if r.ImGui_Selectable(ctx, "Edit Tags") then
+             state.editing_plugin_name = p.name
+             state.edit_buffer = tags_str
+             state.tag_edit_popup_open = true
+         end
+             if r.ImGui_Selectable(ctx, "Sort Tags Ascending") then
+                 settings.sort_column = 3; settings.sort_ascending = true
+             end
+             if r.ImGui_Selectable(ctx, "Sort Tags Descending") then
+                 settings.sort_column = 3; settings.sort_ascending = false
+             end
+             r.ImGui_EndPopup(ctx)
+         end
+         r.ImGui_PopID(ctx)
+               if r.ImGui_IsItemHovered(ctx) and r.ImGui_IsMouseDoubleClicked(ctx, 0) then
+              state.editing_plugin_name = p.name
+              state.edit_buffer = tags_str
+              state.tag_edit_popup_open = true
+               end
 
             -- Pins column
             r.ImGui_TableSetColumnIndex(ctx, 4)
-            local pin_config = nt.pin
-            local pin_label
-            if pin_config then
-                pin_label = format_pin_display(pin_config, false)
-            else
-                pin_label = format_pin_display(nil, true)  -- global
-            end
-
-            r.ImGui_PushID(ctx, i)
-            if r.ImGui_Selectable(ctx, pin_label, false) then end
-
-            if r.ImGui_IsItemHovered(ctx) then
-                if pin_config then
-                    r.ImGui_SetTooltip(ctx, string.format("In: %d/%d  Out: %d/%d\nDouble‑click to edit", pin_config.inL, pin_config.inR, pin_config.outL, pin_config.outR))
-                else
-                    r.ImGui_SetTooltip(ctx, string.format("Global: %s\nDouble‑click to set custom", format_pin_display(nil, true)))
-                end
-            end
-
+              r.ImGui_PushID(ctx, "pins" .. i)
+           local pin_config = nt.pin
+                      local pin_label
+                      if p.is_fxchain then
+                          pin_label = "CHAIN"
+                      else
+                          pin_label = pin_config and format_pin_display(pin_config, false) or format_pin_display(nil, true)
+                      end
+         --   r.ImGui_PushID(ctx, i)
+          if r.ImGui_Selectable(ctx, pin_label, state.selected_plugins[p.name] or false) then
+                       local mods = r.ImGui_GetKeyMods(ctx)
+                       local ctrl = (mods & r.ImGui_Mod_Ctrl()) ~= 0
+                       local shift = (mods & r.ImGui_Mod_Shift()) ~= 0
+                       select_plugin(p.name, i, filtered, mods, shift, ctrl)
+                   end
+         if r.ImGui_IsItemHovered(ctx) then
+             if p.is_fxchain then
+                               r.ImGui_SetTooltip(ctx, "FX Chain – pins cannot be set.\nAdd to chain builder to include.")
+                           elseif pin_config then
+                 if pin_config.mode then
+                 
+                     r.ImGui_SetTooltip(ctx, string.format("Mode: %s\nDouble-click to edit", pin_config.mode))
+                 else
+                     r.ImGui_SetTooltip(ctx, string.format("In: %d/%d Out: %d/%d\nDouble-click to edit", pin_config.inL, pin_config.inR, pin_config.outL, pin_config.outR))
+                 end
+             else
+                 r.ImGui_SetTooltip(ctx, "Global (will follow global mode)\ndouble-click to set custom")
+             end
+         end
+           if not p.is_fxchain then
             if r.ImGui_BeginPopupContextItem(ctx) then
+           
                 if r.ImGui_Selectable(ctx, "Set to Global") then
-                    if notes_tags[p.name] then
-                        notes_tags[p.name].pin = nil
-                        save_table(NOTES_TAGS_FILE, notes_tags)
-                    end
+                    if notes_tags[p.name] then notes_tags[p.name].pin = nil; save_table(NOTES_TAGS_FILE, notes_tags) end
                 end
                 if r.ImGui_Selectable(ctx, "Set Selected to Global") then
                     for name in pairs(state.selected_plugins) do
-                        if notes_tags[name] then
-                            notes_tags[name].pin = nil
-                        end
+                        if notes_tags[name] then notes_tags[name].pin = nil end
                     end
                     save_table(NOTES_TAGS_FILE, notes_tags)
                 end
+                 
                 r.ImGui_EndPopup(ctx)
-            end
-
-            if r.ImGui_IsItemHovered(ctx) and r.ImGui_IsMouseDoubleClicked(ctx, 0) then
-                state.editing_plugin_name = p.name
-                if pin_config then
-                    state.custom_pin_buffer = {
-                        inL = pin_config.inL, inR = pin_config.inR,
-                        outL = pin_config.outL, outR = pin_config.outR
-                    }
-                else
-                    state.custom_pin_buffer = {
-                        inL = settings.pin_preset.inL, inR = settings.pin_preset.inR,
-                        outL = settings.pin_preset.outL, outR = settings.pin_preset.outR
-                    }
-                end
-                state.custom_pin_popup_open = true
-            end
+            end  
+          
+           if r.ImGui_IsItemHovered(ctx) and r.ImGui_IsMouseDoubleClicked(ctx, 0) then
+       
+               state.editing_plugin_name = p.name
+                   state.editing_chain_idx = nil
+               local pin_data = nt.pin
+              if pin_data and pin_data.mode then
+                  state.custom_pin_mode = pin_data.mode
+                  local preset = get_mode_preset(pin_data.mode)
+                  state.custom_pin_buffer = { inL = preset.inL, inR = preset.inR, outL = preset.outL, outR = preset.outR }
+                  state.custom_pin_force_custom = false
+               elseif pin_data and (pin_data.inL ~= nil) then
+                   state.custom_pin_mode = nil
+                   state.custom_pin_buffer = {
+                       inL = pin_data.inL,
+                       inR = pin_data.inR,
+                       outL = pin_data.outL,
+                       outR = pin_data.outR
+                   }
+                   state.custom_pin_force_custom = true
+               else
+                   state.custom_pin_mode = nil
+                   state.custom_pin_buffer = { inL = settings.pin_preset.inL, inR = settings.pin_preset.inR, outL = settings.pin_preset.outL, outR = settings.pin_preset.outR }
+                   state.custom_pin_force_custom = false
+               end
+               state.custom_pin_popup_open = true
+           end
+           end
             r.ImGui_PopID(ctx)
         end
         r.ImGui_EndTable(ctx)
     end
 end
-
--- ----------------------------------------------------------------------
--- Status bar
--- ----------------------------------------------------------------------
+-- status bar 
 local function draw_status_bar()
-    r.ImGui_Separator(ctx)
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ChildBg(), 0x40000000)
-    if r.ImGui_BeginChild(ctx, "status_bar", 0, r.ImGui_GetTextLineHeightWithSpacing(ctx)*1.5) then
-        local selected_names = {}
-        for name in pairs(state.selected_plugins) do selected_names[#selected_names+1] = name end
+    -- Ensure status_bar_height exists
+    if not settings.status_bar_height then settings.status_bar_height = 50 end
 
-        if #selected_names == 1 then
-            local name = selected_names[1]
-            local nt = notes_tags[name] or {}
-            if nt.note and nt.note ~= "" then
-                r.ImGui_Text(ctx, string.format("%s → %s", name, nt.note))
-            else
-                r.ImGui_Text(ctx, string.format("%s (no note)", name))
+    local line_height = r.ImGui_GetTextLineHeightWithSpacing(ctx)
+    local min_height = line_height + 8
+    local max_height = 200
+
+    -- Resize handle
+    r.ImGui_Separator(ctx)
+    local sep_min_x, sep_min_y = r.ImGui_GetItemRectMin(ctx)
+    local sep_max_x, sep_max_y = r.ImGui_GetItemRectMax(ctx)
+    local drag_area_height = 6
+    local drag_min_y = sep_min_y - drag_area_height/2
+    local drag_max_y = sep_max_y + drag_area_height/2
+    r.ImGui_SetCursorScreenPos(ctx, sep_min_x, drag_min_y)
+    r.ImGui_InvisibleButton(ctx, "status_drag", sep_max_x - sep_min_x, drag_max_y - drag_min_y)
+
+    local is_hovering = r.ImGui_IsItemHovered(ctx)
+    if is_hovering then r.ImGui_SetMouseCursor(ctx, r.ImGui_MouseCursor_ResizeNS()) end
+    if is_hovering and r.ImGui_IsMouseClicked(ctx, 0) and not state.resize_dragging then
+        local mouse_x, mouse_y = r.ImGui_GetMousePos(ctx)
+        state.resize_dragging = true
+        state.resize_start_y = mouse_y
+        state.resize_start_height = settings.status_bar_height
+    end
+    if state.resize_dragging and r.ImGui_IsMouseDown(ctx, 0) then
+        local mouse_x, mouse_y = r.ImGui_GetMousePos(ctx)
+        local delta = state.resize_start_y - mouse_y
+        local new_height = state.resize_start_height + delta
+        settings.status_bar_height = math.max(min_height, math.min(max_height, new_height))
+        r.ImGui_SetMouseCursor(ctx, r.ImGui_MouseCursor_ResizeNS())
+    elseif state.resize_dragging and not r.ImGui_IsMouseDown(ctx, 0) then
+        state.resize_dragging = false
+    end
+
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ChildBg(), 0x40000000)
+    if r.ImGui_BeginChild(ctx, "status_bar", 0, settings.status_bar_height, 0, 0) then
+        local names = {}
+        local count = 0
+
+        if state.current_view == "plugins" then
+            -- Plugins view: use state.selected_plugins
+            for name in pairs(state.selected_plugins) do
+                names[#names + 1] = name
+                count = count + 1
             end
-        elseif #selected_names > 1 then
-            r.ImGui_Text(ctx, string.format("%d plugins selected", #selected_names))
+        else
+            -- Chain view: use state.chain_selected_set (1‑based indices)
+            for idx in pairs(state.chain_selected_set) do
+                local item = state.chain_plugins[idx]
+                if item then
+                    names[#names + 1] = item.name
+                    count = count + 1
+                end
+            end
+        end
+
+        if count == 1 then
+            local name = names[1]
+            local nt = notes_tags[name] or {}
+            local note = nt.note or ""
+            local display_note = note_to_display_string(note)
+
+            local max_len = 200
+            if #display_note > max_len then
+                local short = display_note:sub(1, max_len) .. "…"
+                r.ImGui_Text(ctx, short)
+                r.ImGui_SameLine(ctx)
+                if r.ImGui_Button(ctx, "View Full Note") then
+                    state.full_note_plugin = name
+                    state.full_note_text = note
+                    state.full_note_popup_open = true
+                end
+            else
+                if display_note == "" then
+                    r.ImGui_Text(ctx, string.format("%s (no note)", name))
+                else
+                    local display = string.format("%s → %s", name, display_note)
+                    -- Invisible selectable covering the whole area to double‑click
+                    local avail_w, avail_h = r.ImGui_GetContentRegionAvail(ctx)
+                    r.ImGui_InvisibleButton(ctx, "status_selectable", avail_w, avail_h)
+                    if r.ImGui_IsItemHovered(ctx) and r.ImGui_IsMouseDoubleClicked(ctx, 0) then
+                        state.full_note_plugin = name
+                        state.full_note_text = note
+                        state.full_note_popup_open = true
+                    end
+                    r.ImGui_SetCursorPos(ctx, r.ImGui_GetCursorStartPos(ctx))
+                    r.ImGui_TextWrapped(ctx, display)
+                end
+            end
+        elseif count > 1 then
+            local label = (state.current_view == "plugins") and "plugins" or "items"
+            r.ImGui_Text(ctx, string.format("%d %s selected", count, label))
         else
             r.ImGui_Text(ctx, "No selection")
         end
@@ -1357,30 +2970,83 @@ local function draw_status_bar()
     r.ImGui_PopStyleColor(ctx)
 end
 
--- ----------------------------------------------------------------------
--- Keyboard shortcuts
--- ----------------------------------------------------------------------
 local function check_shortcuts()
+ -- if state.key_shortcuts == false then return end
+ -- reaper.ShowConsoleMsg(tostring(state.key_shortcuts))
     local mods = r.ImGui_GetKeyMods(ctx)
     if mods & r.ImGui_Mod_Ctrl() ~= 0 then
         if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_F()) then
-            r.ImGui_SetKeyboardFocusHere(ctx, 0)
+            r.ImGui_SetKeyboardFocusHere(ctx, 0)   -- focus first input (column 2 search)
         end
         if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_K()) then
             state.stay_open = not state.stay_open
         end
     end
     local shift_pressed = mods & r.ImGui_Mod_Shift() ~= 0
-    if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_Enter()) then
-        local names = {}
-        for name in pairs(state.selected_plugins) do names[#names+1] = name end
-        add_plugins_to_track(names, false, false, shift_pressed)
+  -- Chain view shortcuts
+    if state.current_view == "chain" then
+     if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_Enter()) then
+         add_chain_to_track(state.chain_plugins, false)
+     end
+        if mods & r.ImGui_Mod_Ctrl() ~= 0 and r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_S()) then
+            save_chain_as_fxchain()
+        end
+  else
+      -- Plugin view shortcuts
+if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_Enter()) then
+    local chain = build_chain_from_selection()
+    if #chain > 0 then
+        local target_type = state.insert_target
+        if target_type == 1 then
+            -- Take insertion: only regular plugins supported
+            if has_fxchain(chain) then
+                r.ShowMessageBox("Take insertion of FX chains is not yet supported. Please use track insertion.", "Not Supported", 0)
+            else
+                add_plugins_with_configs(chain, shift_pressed)
+            end
+        else
+            -- Track insertion
+            if has_fxchain(chain) then
+                add_chain_to_track(chain, shift_pressed)
+            else
+                add_plugins_with_configs(chain, shift_pressed)
+            end
+        end
     end
 end
+  end
+    -- Delete key to remove selected chain item
+    if state.show_chain and state.chain_selected_set ~= nil then
+        if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_Delete()) then
+             remove_selected_chain_items()
+        end
+    end
+    
+    -- Ctrl+Shift+C: create chain from selected plugins (only in plugin view)
+    if mods & r.ImGui_Mod_Ctrl() ~= 0 and mods & r.ImGui_Mod_Shift() ~= 0 and
+       r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_C()) and state.current_view == "plugins" then
+        local chain = build_chain_from_selection()
+        if #chain > 0 then
+            add_to_chain(chain)
+            state.current_view = "chain"
+        end
+    end
+    -- switch view ctrl + shift + E
+    if mods & r.ImGui_Mod_Ctrl() ~= 0 and mods & r.ImGui_Mod_Shift() ~= 0 and
+       r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_X()) then
+        if state.current_view == "plugins" and #state.chain_plugins > 0 then
+            state.current_view = "chain"
+        elseif state.current_view == "chain" then
+            state.current_view = "plugins"
+        end
+    end
+    
+end
 
--- ----------------------------------------------------------------------
+-- ======================================================================
 -- Main loop
--- ----------------------------------------------------------------------
+-- ======================================================================
+-- loop
 local function loop()
     if not ctx or ctx == 0 then
         r.ShowConsoleMsg("ImGui context lost. Exiting.\n")
@@ -1389,38 +3055,54 @@ local function loop()
 
     r.ImGui_SetNextWindowSize(ctx, 900, 600, r.ImGui_Cond_FirstUseEver())
     local visible, open = r.ImGui_Begin(ctx, "ReaFX Folder", true)
-
+    
     if visible then
         draw_header()
         r.ImGui_Separator(ctx)
 
         local current_y = r.ImGui_GetCursorPosY(ctx)
         local window_height = r.ImGui_GetWindowHeight(ctx)
-        local status_height = r.ImGui_GetTextLineHeightWithSpacing(ctx) * 2 + 10
-        local table_height = window_height - current_y - status_height
+       -- Reserve space for status bar (dynamic height)
+       if not settings.status_bar_height then settings.status_bar_height = 50 end
+       local status_height = settings.status_bar_height
+       local table_height = window_height - (current_y + 20) - status_height
         if table_height < 100 then table_height = 100 end
 
-        if r.ImGui_BeginChild(ctx, "MainTableRegion", 0, table_height, 0, 0) then
-            if r.ImGui_BeginTable(ctx, "main_columns", 2, r.ImGui_TableFlags_Resizable()) then
-                r.ImGui_TableSetupColumn(ctx, "Folders", r.ImGui_TableColumnFlags_WidthFixed(), 250)
-                r.ImGui_TableSetupColumn(ctx, "Plugins", r.ImGui_TableColumnFlags_WidthStretch(), 450)
-                r.ImGui_TableHeadersRow(ctx)
-
-                r.ImGui_TableNextColumn(ctx); draw_column2()
-                r.ImGui_TableNextColumn(ctx); draw_column3()
-                r.ImGui_EndTable(ctx)
-            end
+        if r.ImGui_BeginChild(ctx, "MainTableRegion", 0, table_height) then
+            local num_columns = state.show_chain and 3 or 2
+         local num_columns = state.show_chain and 3 or 2
+         if r.ImGui_BeginTable(ctx, "main_columns", 2, r.ImGui_TableFlags_Resizable()) then
+             r.ImGui_TableSetupColumn(ctx, "Folders", r.ImGui_TableColumnFlags_WidthFixed() | r.ImGui_TableColumnFlags_NoResize(), 180)
+             r.ImGui_TableSetupColumn(ctx, "Contents", r.ImGui_TableColumnFlags_WidthStretch(), 0)
+             r.ImGui_TableHeadersRow(ctx)
+         
+             r.ImGui_TableNextColumn(ctx)
+             draw_column2()          -- folders
+         
+             r.ImGui_TableNextColumn(ctx)
+             if state.current_view == "plugins" then
+                 draw_plugins_list()
+             else
+                 draw_chain_list()
+             end
+         
+             r.ImGui_EndTable(ctx)
+         end
+          
             r.ImGui_EndChild(ctx)
         end
+       draw_chain_rename_popup() 
+        draw_rename_popup()
+        draw_status_bar() 
+        draw_pin_popup() 
+        draw_note_popup() 
+        draw_tag_popup() 
+        draw_custom_pin_popup() 
+        draw_confirmation_popup() 
+        draw_full_note_popup() 
 
-        draw_status_bar()
-        draw_pin_popup()
-        draw_note_popup()
-        draw_tag_popup()
-        draw_custom_pin_popup()
-        draw_confirmation_popup()
-
-        check_shortcuts()
+       check_shortcuts()
+     
         r.ImGui_End(ctx)
     end
 
@@ -1435,5 +3117,4 @@ local function loop()
     end
 end
 
--- Start
 r.defer(loop)

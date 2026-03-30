@@ -976,12 +976,13 @@ local function process_next_pending()
         r.defer(process_next_pending)
         return
     end
-    local final_rename = state.temp_renames[name]
-    if final_rename then
+    -- Apply rename: chain builder rename first, otherwise the stored display name
+    local final_name = item.temp_name or item.display_name
+    if final_name then
         if is_take then
-            r.TakeFX_SetNamedConfigParm(target, fx_idx, "renamed_name", final_rename)
+            r.TakeFX_SetNamedConfigParm(target, fx_idx, "renamed_name", final_name)
         else
-            r.TrackFX_SetNamedConfigParm(target, fx_idx, "renamed_name", final_rename)
+            r.TrackFX_SetNamedConfigParm(target, fx_idx, "renamed_name", final_name)
         end
     end
     local work = nil
@@ -1216,8 +1217,20 @@ local function add_plugins_with_configs(items, bypass_confirmation)
             return
         end
     end
+    -- Build queue items, preserving display_name and temp_name
+    local queue_items = {}
+    for _, item in ipairs(items) do
+        table.insert(queue_items, {
+            name = item.name,
+            display_name = item.display_name,   -- <-- added
+            pin = item.pin,
+            mode = item.mode,
+            temp_name = item.temp_name,
+            is_fxchain = false,
+        })
+    end
     state.pending_add = {
-        items = items,
+        items = queue_items,
         to_new_track = false,
         per_track = false,
         bypass = bypass_confirmation,

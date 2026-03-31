@@ -707,6 +707,24 @@ local state = {
     chain_rename_popup_open = false,
     chain_renaming_idx = nil,
     chain_rename_buffer = "",
+    
+    -- Add to the state table
+    plugin_cache = {
+        valid = false,
+        folder_guid = nil,
+        query = "",
+        tag_filter_hash = "",
+        sort_column = 0,
+        sort_ascending = true,
+        list = nil,
+        filtered_count = 0,
+    },
+    -- Version counters for data that affects the list
+    data_versions = {
+        notes_tags = 0,      -- increments when notes or tags change
+        temp_renames = 0,    -- increments when a plugin is renamed
+        folder_tree = 0,     -- increments when folders are refreshed
+    },
 }
 
 -- ======================================================================
@@ -793,6 +811,25 @@ end
 -- Folder / tag lookup helpers
 -- ======================================================================
 local folder_tree = parse_fx_folders()
+local function get_clean_name(p)
+    if state.temp_renames[p.name] then
+        return state.temp_renames[p.name]
+    end
+    local name = p and p.name or ""
+    name = name:gsub("^%s*[^:]+:%s*", "")
+    name = name:gsub("%s*%([^)]*%)$", "")
+    return name
+end
+-- Precompute lowercase names for all plugins in each folder
+local function precompute_lowercase_names()
+    for _, folder in ipairs(folder_tree) do
+        for _, plugin in ipairs(folder.plugins) do
+            plugin.lower_display = get_clean_name(plugin):lower()
+        end
+    end
+end
+precompute_lowercase_names()
+
 if #folder_tree == 0 then
     r.ShowMessageBox("No folders found. Please create custom folders in REAPER's FX browser.", "Info", 0)
 end
@@ -861,15 +898,36 @@ local function get_tags_in_folder(guid)
     return sorted
 end
 
-local function get_clean_name(p)
-    if state.temp_renames[p.name] then
-        return state.temp_renames[p.name]
+
+local function tag_filter_hash()
+    local keys = {}
+    for tag in pairs(state.tag_filter) do
+        keys[#keys + 1] = tag
     end
-    local name = p and p.name or ""
-    name = name:gsub("^%s*[^:]+:%s*", "")
-    name = name:gsub("%s*%([^)]*%)$", "")
-    return name
+    table.sort(keys)
+    return table.concat(keys, ",")
 end
+
+local function invalidate_plugin_cache()
+    state.plugin_cache.valid = false
+end
+
+-- Call these whenever underlying data changes
+local function bump_notes_tags_version()
+    state.data_versions.notes_tags = state.data_versions.notes_tags + 1
+    invalidate_plugin_cache()
+end
+
+local function bump_temp_renames_version()
+    state.data_versions.temp_renames = state.data_versions.temp_renames + 1
+    invalidate_plugin_cache()
+end
+
+local function bump_folder_tree_version()
+    state.data_versions.folder_tree = state.data_versions.folder_tree + 1
+    invalidate_plugin_cache()
+end
+
 
 -- ======================================================================
 -- Pin routing helpers (unchanged, keep as in original)
@@ -1790,6 +1848,7 @@ local function draw_rename_popup()
         if r.ImGui_Button(ctx, "Save") then
             if state.renaming_plugin and state.rename_buffer ~= "" then
                 state.temp_renames[state.renaming_plugin] = state.rename_buffer
+                 bump_temp_renames_version()   -- <-- add this
             end
             state.renaming_plugin = nil
             state.rename_buffer = ""
@@ -2262,6 +2321,8 @@ local function draw_header()
     if r.ImGui_BeginPopup(ctx, "HeaderMenu") then
         if r.ImGui_Selectable(ctx, "Refresh Data") then
             folder_tree = parse_fx_folders()
+            precompute_lowercase_names()   -- <-- you already have this function
+            bump_folder_tree_version()     -- <-- add this
             if not find_folder_node(settings.go_to_folder_id) then
                 settings.go_to_folder_id = folder_tree[1] and folder_tree[1].guid or nil
             end
@@ -2585,10 +2646,14 @@ local function draw_plugins_list()
     if state.first_run then
         r.ImGui_SetKeyboardFocusHere(ctx, 0)
     end
+
+    -- Search input
     r.ImGui_PushItemWidth(ctx, (r.ImGui_GetWindowWidth(ctx) * 0.58))
     local changed, newval = r.ImGui_InputText(ctx, "##col3search", state.column3_search)
     if changed then state.column3_search = newval end
     r.ImGui_SameLine(ctx)
+
+    -- Tag filter button
     local filter_active = next(state.tag_filter) ~= nil
     if filter_active then
         r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), 0xBB401ADF)
@@ -2600,6 +2665,8 @@ local function draw_plugins_list()
         r.ImGui_PopStyleColor(ctx)
     end
     r.ImGui_PopItemWidth(ctx)
+
+    -- Tag filter popup
     if r.ImGui_BeginPopup(ctx, "TagFilterPopup") then
         r.ImGui_Text(ctx, "Filter by tag (check to include):")
         r.ImGui_Separator(ctx)
@@ -2608,12 +2675,18 @@ local function draw_plugins_list()
             local checked = state.tag_filter[tag] or false
             local clicked, new_checked = r.ImGui_Checkbox(ctx, tag, checked)
             if clicked then
-                if new_checked then state.tag_filter[tag] = true else state.tag_filter[tag] = nil end
+                if new_checked then
+                    state.tag_filter[tag] = true
+                else
+                    state.tag_filter[tag] = nil
+                end
+                invalidate_plugin_cache()   -- tag filter changed
             end
         end
         r.ImGui_Separator(ctx)
         if r.ImGui_Button(ctx, "Clear All") then
             state.tag_filter = {}
+            invalidate_plugin_cache()
             r.ImGui_CloseCurrentPopup(ctx)
         end
         r.ImGui_SameLine(ctx)
@@ -2622,48 +2695,122 @@ local function draw_plugins_list()
         end
         r.ImGui_EndPopup(ctx)
     end
-    local plugins = state.selected_folder_guid and get_folder_plugins(state.selected_folder_guid) or {}
-    local query = state.column3_search:lower()
-    local filtered = {}
-    for _, p in ipairs(plugins) do
-        local display_name = get_clean_name(p)
-        local match_search = query == "" or plain_find(display_name:lower(), query) or plain_find((p.name or ""):lower(), query)
-        if match_search and folder_passes_tag_filter(p.name) then
-            filtered[#filtered + 1] = p
+
+    -- Cache check
+    local cache = state.plugin_cache
+    local current_folder_guid = state.selected_folder_guid
+    local current_query = state.column3_search
+    local current_tag_hash = tag_filter_hash()
+    local current_sort_col = settings.sort_column
+    local current_sort_asc = settings.sort_ascending
+    local current_notes_version = state.data_versions.notes_tags
+    local current_renames_version = state.data_versions.temp_renames
+    local current_folder_version = state.data_versions.folder_tree
+
+    local need_recompute = not cache.valid
+        or cache.folder_guid ~= current_folder_guid
+        or cache.query ~= current_query
+        or cache.tag_filter_hash ~= current_tag_hash
+        or cache.sort_column ~= current_sort_col
+        or cache.sort_ascending ~= current_sort_asc
+        or cache.notes_version ~= current_notes_version
+        or cache.renames_version ~= current_renames_version
+        or cache.folder_version ~= current_folder_version
+
+    if need_recompute then
+        local folder = find_folder_node(current_folder_guid)
+        local plugins = folder and folder.plugins or {}
+        local filtered = {}
+        local query_lower = current_query:lower()
+        local tag_filter = state.tag_filter
+        local has_tag_filter = next(tag_filter) ~= nil
+
+        for _, p in ipairs(plugins) do
+            -- Match search (use precomputed lower_name and compute lower_display on the fly)
+            local display_name = get_clean_name(p)
+            local lower_display = display_name:lower()
+            local match_search = current_query == "" or
+                plain_find(lower_display, query_lower) or
+                plain_find(p.lower_name, query_lower)
+
+            if not match_search then goto skip end
+
+            -- Tag filter
+            if has_tag_filter then
+                local nt = notes_tags[p.name]
+                local tags = nt and nt.tags
+                local matched = false
+                if tags then
+                    for filter_tag in pairs(tag_filter) do
+                        for _, t in ipairs(tags) do
+                            if t == filter_tag then matched = true; break end
+                        end
+                        if matched then break end
+                    end
+                end
+                if not matched then goto skip end
+            end
+
+            table.insert(filtered, p)
+            ::skip::
         end
-    end
+
+    -- Sort filtered list (safe against nil values)
     table.sort(filtered, function(a, b)
         local va, vb
-        if settings.sort_column == 0 then
-            va = get_clean_name(a)
-            vb = get_clean_name(b)
-        elseif settings.sort_column == 1 then
-            va = a.type
-            vb = b.type
-        elseif settings.sort_column == 2 then
-            va = a.developer
-            vb = b.developer
-        elseif settings.sort_column == 3 then
+        if current_sort_col == 0 then
+            va = get_clean_name(a):lower()
+            vb = get_clean_name(b):lower()
+        elseif current_sort_col == 1 then
+            va = a.type or ""
+            vb = b.type or ""
+        elseif current_sort_col == 2 then
+            va = a.developer or ""
+            vb = b.developer or ""
+        elseif current_sort_col == 3 then
             local nta = notes_tags[a.name] or {}
             local ntb = notes_tags[b.name] or {}
             va = (nta.tags and table.concat(nta.tags, ", ")) or ""
             vb = (ntb.tags and table.concat(ntb.tags, ", ")) or ""
+            va = va:lower()
+            vb = vb:lower()
         else
-            va = a.name
-            vb = b.name
+            va = a.lower_name or ""
+            vb = b.lower_name or ""
         end
-        va = tostring(va or ""):lower()
-        vb = tostring(vb or ""):lower()
-        if settings.sort_ascending then return va < vb else return va > vb end
+        if current_sort_asc then
+            return va < vb
+        else
+            return va > vb
+        end
     end)
-    if (state.first_run or changed) then
+
+        -- Update cache
+        cache.valid = true
+        cache.folder_guid = current_folder_guid
+        cache.query = current_query
+        cache.tag_filter_hash = current_tag_hash
+        cache.sort_column = current_sort_col
+        cache.sort_ascending = current_sort_asc
+        cache.notes_version = current_notes_version
+        cache.renames_version = current_renames_version
+        cache.folder_version = current_folder_version
+        cache.list = filtered
+    end
+
+    local filtered = cache.list
+
+    -- Auto‑select first plugin only when list changes
+    if (state.first_run or need_recompute) then
         state.first_run = false
-        if #filtered > 0 and state.custom_select == false then
+        if #filtered > 0 and not state.custom_select then
             state.selected_plugins = {}
             state.selected_plugins[filtered[1].name] = true
             state.last_clicked_index = 1
         end
     end
+
+    -- Draw table
     local col_flags = r.ImGui_TableFlags_Resizable() | r.ImGui_TableFlags_Borders()
     if r.ImGui_BeginTable(ctx, "col3table", 5, col_flags) then
         r.ImGui_TableSetupColumn(ctx, "Type", r.ImGui_TableColumnFlags_WidthFixed() | r.ImGui_TableColumnFlags_NoResize(), 40)
@@ -2672,11 +2819,15 @@ local function draw_plugins_list()
         r.ImGui_TableSetupColumn(ctx, "Tags", r.ImGui_TableColumnFlags_WidthFixed(), 120)
         r.ImGui_TableSetupColumn(ctx, "Pins", r.ImGui_TableColumnFlags_WidthStretch(), 80)
         r.ImGui_TableHeadersRow(ctx)
+
         for i, p in ipairs(filtered) do
             local nt = notes_tags[p.name] or {}
             local tags_str = nt.tags and table.concat(nt.tags, ", ") or ""
             local display_name = get_clean_name(p)
+
             r.ImGui_TableNextRow(ctx)
+
+            -- Type column
             r.ImGui_TableSetColumnIndex(ctx, 0)
             r.ImGui_PushID(ctx, "type" .. i)
             if r.ImGui_Selectable(ctx, p.type, state.selected_plugins[p.name] or false) then
@@ -2686,13 +2837,17 @@ local function draw_plugins_list()
             if r.ImGui_BeginPopupContextItem(ctx) then
                 if r.ImGui_Selectable(ctx, "Sort Type Ascending") then
                     settings.sort_column = 1; settings.sort_ascending = true
+                    invalidate_plugin_cache()
                 end
                 if r.ImGui_Selectable(ctx, "Sort Type Descending") then
                     settings.sort_column = 1; settings.sort_ascending = false
+                    invalidate_plugin_cache()
                 end
                 r.ImGui_EndPopup(ctx)
             end
             r.ImGui_PopID(ctx)
+
+            -- Name column
             r.ImGui_TableSetColumnIndex(ctx, 1)
             local selected = state.selected_plugins[p.name] or false
             if r.ImGui_Selectable(ctx, display_name, selected) then
@@ -2704,24 +2859,25 @@ local function draw_plugins_list()
                     state.editing_plugin_name = p.name
                     state.edit_buffer = nt.note or ""
                     state.note_edit_popup_open = true
-                      state.popups_opened =   state.popups_opened + 1
                 end
                 if r.ImGui_Selectable(ctx, "Rename") then
                     state.renaming_plugin = p.name
-                    state.rename_buffer = get_clean_name(p)
+                    state.rename_buffer = display_name
                     state.rename_popup_open = true
-                      state.popups_opened =   state.popups_opened + 1
                 end
                 if state.temp_renames[p.name] ~= nil then
                     if r.ImGui_Selectable(ctx, "Reset Name") then
                         state.temp_renames[p.name] = nil
+                        bump_temp_renames_version()
                     end
                 end
                 if r.ImGui_Selectable(ctx, "Sort Name Ascending") then
                     settings.sort_column = 0; settings.sort_ascending = true
+                    invalidate_plugin_cache()
                 end
                 if r.ImGui_Selectable(ctx, "Sort Name Descending") then
                     settings.sort_column = 0; settings.sort_ascending = false
+                    invalidate_plugin_cache()
                 end
                 if count_selected() > 0 then
                     if r.ImGui_Selectable(ctx, "Add selected to FX Chain") then
@@ -2733,10 +2889,11 @@ local function draw_plugins_list()
             end
             if r.ImGui_IsItemHovered(ctx) and r.ImGui_IsMouseDoubleClicked(ctx, 0) then
                 state.renaming_plugin = p.name
-                state.rename_buffer = get_clean_name(p)
+                state.rename_buffer = display_name
                 state.rename_popup_open = true
-                  state.popups_opened =   state.popups_opened + 1
             end
+
+            -- Developer column
             r.ImGui_TableSetColumnIndex(ctx, 2)
             r.ImGui_PushID(ctx, "dev" .. i)
             if r.ImGui_Selectable(ctx, p.developer, state.selected_plugins[p.name] or false) then
@@ -2746,13 +2903,17 @@ local function draw_plugins_list()
             if r.ImGui_BeginPopupContextItem(ctx) then
                 if r.ImGui_Selectable(ctx, "Sort Developer Ascending") then
                     settings.sort_column = 2; settings.sort_ascending = true
+                    invalidate_plugin_cache()
                 end
                 if r.ImGui_Selectable(ctx, "Sort Developer Descending") then
                     settings.sort_column = 2; settings.sort_ascending = false
+                    invalidate_plugin_cache()
                 end
                 r.ImGui_EndPopup(ctx)
             end
             r.ImGui_PopID(ctx)
+
+            -- Tags column
             r.ImGui_TableSetColumnIndex(ctx, 3)
             r.ImGui_PushID(ctx, "tags" .. i)
             if r.ImGui_Selectable(ctx, tags_str, state.selected_plugins[p.name] or false) then
@@ -2764,13 +2925,14 @@ local function draw_plugins_list()
                     state.editing_plugin_name = p.name
                     state.edit_buffer = tags_str
                     state.tag_edit_popup_open = true
-                      state.popups_opened =   state.popups_opened + 1
                 end
                 if r.ImGui_Selectable(ctx, "Sort Tags Ascending") then
                     settings.sort_column = 3; settings.sort_ascending = true
+                    invalidate_plugin_cache()
                 end
                 if r.ImGui_Selectable(ctx, "Sort Tags Descending") then
                     settings.sort_column = 3; settings.sort_ascending = false
+                    invalidate_plugin_cache()
                 end
                 r.ImGui_EndPopup(ctx)
             end
@@ -2779,8 +2941,9 @@ local function draw_plugins_list()
                 state.editing_plugin_name = p.name
                 state.edit_buffer = tags_str
                 state.tag_edit_popup_open = true
-                  state.popups_opened =   state.popups_opened + 1
             end
+
+            -- Pins column
             r.ImGui_TableSetColumnIndex(ctx, 4)
             r.ImGui_PushID(ctx, "pins" .. i)
             local pin_config = nt.pin
@@ -2812,12 +2975,14 @@ local function draw_plugins_list()
                     if r.ImGui_Selectable(ctx, "Set to Global") then
                         if notes_tags[p.name] then notes_tags[p.name].pin = nil end
                         save_table(NOTES_TAGS_FILE, notes_tags)
+                        bump_notes_tags_version()
                     end
                     if r.ImGui_Selectable(ctx, "Set Selected to Global") then
                         for name in pairs(state.selected_plugins) do
                             if notes_tags[name] then notes_tags[name].pin = nil end
                         end
                         save_table(NOTES_TAGS_FILE, notes_tags)
+                        bump_notes_tags_version()
                     end
                     r.ImGui_EndPopup(ctx)
                 end
@@ -2845,7 +3010,6 @@ local function draw_plugins_list()
                         state.custom_pin_force_custom = false
                     end
                     state.custom_pin_popup_open = true
-                      state.popups_opened =   state.popups_opened + 1
                 end
             end
             r.ImGui_PopID(ctx)

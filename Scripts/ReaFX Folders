@@ -6,6 +6,13 @@
 --   Parses reaper-fxfolders.ini directly. Features: stay-open toggle, shift+enter bypass,
 --   dynamic unused pair detection for SC modes, column sorting, tag filtering.
 -- @noindex
+--
+-- Refactor goals:
+--   * keep the script single-file
+--   * harden nil/edge-case handling
+--   * remove mutation bugs in smart-folder evaluation
+--   * make the hottest helpers easier to maintain
+--   * preserve the existing workflow and UI
 
 local r = reaper
 
@@ -223,290 +230,267 @@ local function parse_fx_folders()
         ["or"]  = { " or ", " %s:find(%q, 1, true) " },
         ["and"] = { " and ", "%s:find(%q, 1, true) " },
     }
-    local function parse_smart_folder(smart_string)
-        smart_string = tostring(smart_string or "")
     
-        local console = (r and r.ShowConsoleMsg) or (reaper and reaper.ShowConsoleMsg)
-        local function log(msg)
-            if console then console(msg) end
-        end
-    
-        if type(plugin_list) ~= "table" then
-            log("Smart folder error: plugin_list is missing or invalid\n")
-            return {}
-        end
-    
-        -- Tokeniser (byte comparisons, lowercase normalization)
-        local tokens = {}
-        local pos = 1
-        local len = #smart_string
-    
-        while pos <= len do
-            local b = smart_string:byte(pos)
-    
-            if b == 32 or b == 9 then
-                pos = pos + 1
-    
-            elseif b == 40 then -- '('
-                tokens[#tokens + 1] = "("
-                pos = pos + 1
-    
-            elseif b == 41 then -- ')'
-                tokens[#tokens + 1] = ")"
-                pos = pos + 1
-    
-            elseif b == 34 then -- '"'
-                local start = pos + 1
-                local qpos = start
-                local found = false
-    
-                while qpos <= len do
-                    local qb = smart_string:byte(qpos)
-                    if qb == 34 and smart_string:byte(qpos - 1) ~= 92 then
-                        found = true
-                        break
-                    end
-                    qpos = qpos + 1
-                end
-    
-                local phrase = smart_string:sub(start, found and (qpos - 1) or len):lower()
-                tokens[#tokens + 1] = phrase
-    
-                if found then
-                    pos = qpos + 1
-                else
-                    log("Smart folder warning: unterminated quote; using rest of line\n")
-                    pos = len + 1
-                end
-    
-            else
-                local start = pos
-                while pos <= len do
-                    local c = smart_string:byte(pos)
-                    if c == 32 or c == 9 or c == 40 or c == 41 then
-                        break
-                    end
-                    pos = pos + 1
-                end
-    
-                tokens[#tokens + 1] = smart_string:sub(start, pos - 1):lower()
-            end
-        end
-    
-        if #tokens == 0 then
-            return {}
-        end
-    
-        -- Build a dense plugin list so gaps in plugin_list cannot break matching
-        local plugin_indices = {}
-        local lower_plugins = {}
-    
-        for i, name in ipairs(plugin_list) do
-            if type(name) == "string" then
-                local dense_i = #plugin_indices + 1
-                plugin_indices[dense_i] = i
-                lower_plugins[dense_i] = name:lower()
-            end
-        end
-    
-        local plugin_count = #lower_plugins
-        if plugin_count == 0 then
-            return {}
-        end
-    
-        -- Cache term matches: term -> boolean array
-        local term_cache = {}
-    
-        local function clone_false_array()
-            local arr = {}
-            for i = 1, plugin_count do
-                arr[i] = false
-            end
-            return arr
-        end
-    
-        local function and_arrays(a, b)
-            for i = 1, plugin_count do
-                a[i] = a[i] and b[i]
-            end
-            return a
-        end
-        
-        local function or_arrays(a, b)
-            for i = 1, plugin_count do
-                a[i] = a[i] or b[i]
-            end
-            return a
-        end
-        
-        local function not_array(a)
-            for i = 1, plugin_count do
-                a[i] = not a[i]
-            end
-            return a
-        end
-    
-        local function get_term_array(term)
-            local cached = term_cache[term]
-            if cached then
-                return cached
-            end
-    
-            local arr = {}
-            for i = 1, plugin_count do
-                local str = lower_plugins[i]
-                arr[i] = (str ~= nil) and (str:find(term, 1, true) ~= nil) or false
-            end
-    
-            term_cache[term] = arr
-            return arr
-        end
-    
-        -- Recursive descent parser
-        local idx = 1
-        local function peek() return tokens[idx] end
-        local function consume()
-            local t = tokens[idx]
-            idx = idx + 1
-            return t
-        end
-    
-        local parse_expression
-    
-        local function is_primary_start(tok)
-            return tok and tok ~= "and" and tok ~= "or" and tok ~= ")"
-        end
-    
-        local function parse_primary()
-            local token = peek()
-    
-            if not token then
-                return nil, "unexpected end of expression"
-            end
-    
-            if token == "not" then
-                consume()
-                local arr, err = parse_primary()
-                if not arr then return nil, err end
-                return not_array(arr)
-    
-            elseif token == "(" then
-                consume()
-                local arr, err = parse_expression()
-                if not arr then return nil, err end
-    
-                if peek() ~= ")" then
-                    return nil, "missing ')'"
-                end
-    
-                consume()
-                return arr
-    
-            elseif token == "and" or token == "or" then
-                return nil, "unexpected operator '" .. token .. "'"
-    
-            else
-                consume()
-                return get_term_array(token)
-            end
-        end
-    
-        local function parse_and()
-            local left, err = parse_primary()
-            if not left then return nil, err end
-    
-            while true do
-                local op = peek()
-                if not op then
-                    break
-                end
-    
-                if op == "and" then
-                    consume()
-                    local right, err = parse_primary()
-                    if not right then return nil, err end
-                    left = and_arrays(left, right)
-    
-                elseif op == "not" then
-                    -- Keep your existing shorthand:
-                    -- A NOT B  -> A AND NOT B
-                    consume()
-                    local right, err = parse_primary()
-                    if not right then return nil, err end
-                    left = and_arrays(left, not_array(right))
-    
-                elseif is_primary_start(op) then
-                    -- Implicit AND:
-                    -- comp limiter  -> comp AND limiter
-                    local right, err = parse_primary()
-                    if not right then return nil, err end
-                    left = and_arrays(left, right)
-    
-                else
-                    break
-                end
-            end
-    
-            return left
-        end
-    
-        local function parse_or()
-            local left, err = parse_and()
-            if not left then return nil, err end
-    
-            while true do
-                local op = peek()
-                if not op then
-                    break
-                end
-    
-                if op == "or" then
-                    consume()
-                    local right, err = parse_and()
-                    if not right then return nil, err end
-                    left = or_arrays(left, right)
-                else
-                    break
-                end
-            end
-    
-            return left
-        end
-    
-        parse_expression = function()
-            return parse_or()
-        end
-    
-        local result_array, err = parse_expression()
-        if not result_array then
-            log("Smart folder parse error: " .. err .. "\n")
-            return {}
-        end
-    
-        if idx <= #tokens then
-            local remaining = {}
-            for i = idx, #tokens do
-                remaining[#remaining + 1] = tokens[i]
-            end
-            log("Smart folder parse warning: extra tokens ignored: " .. table.concat(remaining, " ") .. "\n")
-        end
-    
-        -- Collect matching plugins
-        local smart_fx = {}
-        for i = 1, plugin_count do
-            if result_array[i] then
-                local original_idx = plugin_indices[i]
-                local name = plugin_list[original_idx]
-                if type(name) == "string" then
-                    smart_fx[#smart_fx + 1] = name
-                end
-            end
-        end
-    
-        return smart_fx
+local function parse_smart_folder(smart_string)
+    smart_string = tostring(smart_string or "")
+
+    local console = (r and r.ShowConsoleMsg) or (reaper and reaper.ShowConsoleMsg)
+    local function log(msg)
+        if console then console(msg) end
     end
 
-    local f = io.open(FXFOLDERS_INI, "r")
+    if type(plugin_list) ~= "table" then
+        log("Smart folder error: plugin_list is missing or invalid\n")
+        return {}
+    end
+
+    -- Tokenise once. Operators are case-insensitive; phrases in quotes stay intact.
+    local tokens = {}
+    local pos, len = 1, #smart_string
+
+    while pos <= len do
+        local b = smart_string:byte(pos)
+
+        if b == 32 or b == 9 then
+            pos = pos + 1
+
+        elseif b == 40 then -- (
+            tokens[#tokens + 1] = "("
+            pos = pos + 1
+
+        elseif b == 41 then -- )
+            tokens[#tokens + 1] = ")"
+            pos = pos + 1
+
+        elseif b == 34 then -- "
+            local start = pos + 1
+            local qpos = start
+            local found = false
+
+            while qpos <= len do
+                local qb = smart_string:byte(qpos)
+                if qb == 34 and smart_string:byte(qpos - 1) ~= 92 then
+                    found = true
+                    break
+                end
+                qpos = qpos + 1
+            end
+
+            tokens[#tokens + 1] = smart_string:sub(start, found and (qpos - 1) or len):lower()
+            pos = found and (qpos + 1) or (len + 1)
+
+            if not found then
+                log("Smart folder warning: unterminated quote; using rest of line\n")
+            end
+
+        else
+            local start = pos
+            while pos <= len do
+                local c = smart_string:byte(pos)
+                if c == 32 or c == 9 or c == 40 or c == 41 then break end
+                pos = pos + 1
+            end
+            tokens[#tokens + 1] = smart_string:sub(start, pos - 1):lower()
+        end
+    end
+
+    if #tokens == 0 then
+        return {}
+    end
+
+    -- Build a dense plugin list so nil holes in plugin_list do not break evaluation.
+    local plugin_indices = {}
+    local lower_plugins = {}
+
+    for i, name in ipairs(plugin_list) do
+        if type(name) == "string" then
+            local dense_i = #plugin_indices + 1
+            plugin_indices[dense_i] = i
+            lower_plugins[dense_i] = name:lower()
+        end
+    end
+
+    local plugin_count = #lower_plugins
+    if plugin_count == 0 then
+        return {}
+    end
+
+    -- Cache each term exactly once. The boolean arrays are treated as immutable.
+    local term_cache = {}
+
+    local function and_arrays(a, b)
+        local out = {}
+        for i = 1, plugin_count do
+            out[i] = (a and a[i] or false) and (b and b[i] or false)
+        end
+        return out
+    end
+
+    local function or_arrays(a, b)
+        local out = {}
+        for i = 1, plugin_count do
+            out[i] = (a and a[i] or false) or (b and b[i] or false)
+        end
+        return out
+    end
+
+    local function not_array(a)
+        local out = {}
+        for i = 1, plugin_count do
+            out[i] = not (a and a[i] or false)
+        end
+        return out
+    end
+
+    local find = string.find
+    local function get_term_array(term)
+        local cached = term_cache[term]
+        if cached then
+            return cached
+        end
+
+        local arr = {}
+        for i = 1, plugin_count do
+            local str = lower_plugins[i]
+            arr[i] = (str ~= nil) and (find(str, term, 1, true) ~= nil) or false
+        end
+
+        term_cache[term] = arr
+        return arr
+    end
+
+    -- Recursive descent parser: NOT > AND (including implicit AND) > OR
+    local idx = 1
+    local function peek() return tokens[idx] end
+    local function consume()
+        local t = tokens[idx]
+        idx = idx + 1
+        return t
+    end
+
+    local parse_expression -- forward declaration
+
+    local function is_primary_start(tok)
+        return tok and tok ~= "and" and tok ~= "or" and tok ~= ")"
+    end
+
+    local function parse_primary()
+        local token = peek()
+        if not token then
+            return nil, "unexpected end of expression"
+        end
+
+        if token == "not" then
+            consume()
+            local expr, err = parse_primary()
+            if not expr then return nil, err end
+            return not_array(expr)
+
+        elseif token == "(" then
+            consume()
+            local expr, err = parse_expression()
+            if not expr then return nil, err end
+            if peek() ~= ")" then
+                return nil, "missing ')'"
+            end
+            consume()
+            return expr
+
+        elseif token == "and" or token == "or" then
+            return nil, "unexpected operator '" .. token .. "'"
+
+        else
+            consume()
+            return get_term_array(token)
+        end
+    end
+
+    local function parse_and()
+        local left, err = parse_primary()
+        if not left then return nil, err end
+
+        while true do
+            local op = peek()
+            if not op then break end
+
+            if op == "and" then
+                consume()
+                local right, err = parse_primary()
+                if not right then return nil, err end
+                left = and_arrays(left, right)
+
+            elseif op == "not" then
+                -- Kept for backward compatibility:
+                --   A not B  == A and not B
+                consume()
+                local right, err = parse_primary()
+                if not right then return nil, err end
+                left = and_arrays(left, not_array(right))
+
+            elseif is_primary_start(op) then
+                -- Implicit AND:
+                --   comp limiter == comp and limiter
+                local right, err = parse_primary()
+                if not right then return nil, err end
+                left = and_arrays(left, right)
+
+            else
+                break
+            end
+        end
+
+        return left
+    end
+
+    local function parse_or()
+        local left, err = parse_and()
+        if not left then return nil, err end
+
+        while peek() == "or" do
+            consume()
+            local right, err = parse_and()
+            if not right then return nil, err end
+            left = or_arrays(left, right)
+        end
+
+        return left
+    end
+
+    parse_expression = function()
+        return parse_or()
+    end
+
+    local result_array, err = parse_expression()
+    if not result_array then
+        log("Smart folder parse error: " .. err .. "\n")
+        return {}
+    end
+
+    if idx <= #tokens then
+        local remaining = {}
+        for i = idx, #tokens do
+            remaining[#remaining + 1] = tokens[i]
+        end
+        log("Smart folder parse warning: extra tokens ignored: " .. table.concat(remaining, " ") .. "\n")
+    end
+
+    -- Collect matching plugins.
+    local smart_fx = {}
+    for i = 1, plugin_count do
+        if result_array[i] then
+            local original_idx = plugin_indices[i]
+            local name = plugin_list[original_idx]
+            if type(name) == "string" then
+                smart_fx[#smart_fx + 1] = name
+            end
+        end
+    end
+
+    return smart_fx
+end
+
+local f = io.open(FXFOLDERS_INI, "r")
+
     if not f then return {} end
 
     local folders_by_idx = {}
@@ -812,10 +796,18 @@ end
 -- ======================================================================
 local folder_tree = parse_fx_folders()
 local function get_clean_name(p)
-    if state.temp_renames[p.name] then
-        return state.temp_renames[p.name]
+    -- Defensive: plugin tables can be missing or partially built during refresh.
+    if type(p) ~= "table" then
+        return ""
     end
-    local name = p and p.name or ""
+
+    local raw_name = p.name or ""
+    if state.temp_renames and state.temp_renames[raw_name] then
+        return state.temp_renames[raw_name]
+    end
+
+    local name = raw_name
+    -- Strip leading type/vendor prefixes and trailing "(Developer)" suffixes for display.
     name = name:gsub("^%s*[^:]+:%s*", "")
     name = name:gsub("%s*%([^)]*%)$", "")
     return name

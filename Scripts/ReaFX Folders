@@ -1871,6 +1871,44 @@ local function draw_note_popup()
     local popup = "note_edit_popup_open"
     if begin_centered_modal("Add/Edit Note", popup) then
         r.ImGui_Text(ctx, state.editing_plugin_name or "")
+
+        -- Help button and insert buttons
+        r.ImGui_SameLine(ctx)
+        if r.ImGui_Button(ctx, "?") then
+            r.ImGui_OpenPopup(ctx, "LinkSyntaxHelp")
+        end
+        r.ImGui_SetItemTooltip(ctx, "Show link syntax help")
+        r.ImGui_SameLine(ctx)
+        if r.ImGui_Button(ctx, "Insert Link") then
+            -- Insert a template at the current cursor position (append for simplicity)
+            local template = "\n<link https://www.example.com @Example>"
+            state.edit_buffer = state.edit_buffer .. template
+        end
+        r.ImGui_SetItemTooltip(ctx, "Insert a web link template")
+        r.ImGui_SameLine(ctx)
+        if r.ImGui_Button(ctx, "Insert File") then
+            local template = "\n<file C:\\path\\to\\file @File>"
+            state.edit_buffer = state.edit_buffer .. template
+        end
+        r.ImGui_SetItemTooltip(ctx, "Insert a file link template")
+
+        -- Help popup
+        if r.ImGui_BeginPopup(ctx, "LinkSyntaxHelp", r.ImGui_WindowFlags_AlwaysAutoResize()) then
+            r.ImGui_Text(ctx, "Link Syntax:")
+            r.ImGui_BulletText(ctx, "Web link: <link URL @placeholder>")
+            r.ImGui_Text(ctx, "Example: <link https://www.reapertips.com @Reaper Tips>")
+            r.ImGui_BulletText(ctx, "File link: <file PATH @placeholder>")
+            r.ImGui_Text(ctx, "Example: <file C:\\Users\\Me\\readme.txt @Readme>")
+            r.ImGui_Separator(ctx)
+            r.ImGui_Text(ctx, "Only the placeholder is shown in the status bar.")
+            r.ImGui_Text(ctx, "Clicking the placeholder opens the link/file.")
+            if r.ImGui_Button(ctx, "Close") then
+                r.ImGui_CloseCurrentPopup(ctx)
+            end
+            r.ImGui_EndPopup(ctx)
+        end
+
+        -- Note editor
         if r.ImGui_BeginChild(ctx, "note_scroll", 0, -r.ImGui_GetTextLineHeightWithSpacing(ctx) - 10, 0, 0) then
             local flags = r.ImGui_InputTextFlags_CtrlEnterForNewLine()
             focus()
@@ -1878,18 +1916,20 @@ local function draw_note_popup()
             if changed then state.edit_buffer = buf end
             r.ImGui_EndChild(ctx)
         end
+
         r.ImGui_Spacing(ctx)
         if r.ImGui_Button(ctx, "Save") then
             if state.editing_plugin_name then
                 notes_tags[state.editing_plugin_name] = notes_tags[state.editing_plugin_name] or {}
                 notes_tags[state.editing_plugin_name].note = state.edit_buffer
                 save_table(NOTES_TAGS_FILE, notes_tags)
+                bump_notes_tags_version()
             end
             close_popup(popup)
         end
         r.ImGui_SameLine(ctx)
         if r.ImGui_Button(ctx, "Cancel") then
-          close_popup(popup)
+            close_popup(popup)
         end
         r.ImGui_EndPopup(ctx)
     end
@@ -2729,27 +2769,41 @@ local function draw_plugins_list()
             -- Match search (use precomputed lower_name and compute lower_display on the fly)
             local display_name = get_clean_name(p)
             local lower_display = display_name:lower()
-            local match_search = current_query == "" or
-                plain_find(lower_display, query_lower) or
-                plain_find(p.lower_name, query_lower)
-
-            if not match_search then goto skip end
-
-            -- Tag filter
-            if has_tag_filter then
-                local nt = notes_tags[p.name]
-                local tags = nt and nt.tags
-                local matched = false
-                if tags then
-                    for filter_tag in pairs(tag_filter) do
-                        for _, t in ipairs(tags) do
-                            if t == filter_tag then matched = true; break end
-                        end
-                        if matched then break end
-                    end
-                end
-                if not matched then goto skip end
-            end
+           local match_search = false
+           local query_lower = current_query:lower()
+           
+           -- Check for prefix
+           if query_lower:match("^dev:") then
+               local dev_term = query_lower:sub(5)
+               if dev_term ~= "" then
+                   match_search = plain_find((p.developer or ""):lower(), dev_term)
+               else
+                   match_search = true   -- empty dev: shows all
+               end
+           elseif query_lower:match("^tag:") then
+               local tag_term = query_lower:sub(5)
+               if tag_term ~= "" then
+                   local nt = notes_tags[p.name]
+                   local tags = nt and nt.tags or {}
+                   for _, t in ipairs(tags) do
+                       if plain_find(t:lower(), tag_term) then
+                           match_search = true
+                           break
+                       end
+                   end
+               else
+                   match_search = true
+               end
+           else
+               -- Default: name search
+               local display_name = get_clean_name(p)
+               local lower_display = display_name:lower()
+               match_search = current_query == "" or
+                   plain_find(lower_display, query_lower) or
+                   plain_find(p.lower_name, query_lower)
+           end
+           
+           if not match_search then goto skip end
 
             table.insert(filtered, p)
             ::skip::

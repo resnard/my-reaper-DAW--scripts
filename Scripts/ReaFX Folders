@@ -224,45 +224,285 @@ local function parse_fx_folders()
         ["and"] = { " and ", "%s:find(%q, 1, true) " },
     }
     local function parse_smart_folder(smart_string)
-        local smart_terms = {}
-        local smart_fx = {}
-        for exact in smart_string:gmatch('"(.-)"') do
-            smart_string = smart_string:gsub(exact, '_schwa_magic_' .. exact:gsub(' ', '|||'))
+        smart_string = tostring(smart_string or "")
+    
+        local console = (r and r.ShowConsoleMsg) or (reaper and reaper.ShowConsoleMsg)
+        local function log(msg)
+            if console then console(msg) end
         end
-        smart_string = smart_string:gsub('"', '')
-        for term in smart_string:gmatch("([^%s]+)") do
-            term = term:lower():gsub('[%(%)%.%+%-%*%?%[%]%^%$%%]', '%%%1')
-            if term:find('_schwa_magic_') then
-                term = term:gsub('_schwa_magic_', '')
-                if term:find('|||') then
-                    term = '(' .. term:gsub('|||', ' ') .. ')'
-                else
-                    term = '%A' .. term .. '%A'
+    
+        if type(plugin_list) ~= "table" then
+            log("Smart folder error: plugin_list is missing or invalid\n")
+            return {}
+        end
+    
+        -- Tokeniser (byte comparisons, lowercase normalization)
+        local tokens = {}
+        local pos = 1
+        local len = #smart_string
+    
+        while pos <= len do
+            local b = smart_string:byte(pos)
+    
+            if b == 32 or b == 9 then
+                pos = pos + 1
+    
+            elseif b == 40 then -- '('
+                tokens[#tokens + 1] = "("
+                pos = pos + 1
+    
+            elseif b == 41 then -- ')'
+                tokens[#tokens + 1] = ")"
+                pos = pos + 1
+    
+            elseif b == 34 then -- '"'
+                local start = pos + 1
+                local qpos = start
+                local found = false
+    
+                while qpos <= len do
+                    local qb = smart_string:byte(qpos)
+                    if qb == 34 and smart_string:byte(qpos - 1) ~= 92 then
+                        found = true
+                        break
+                    end
+                    qpos = qpos + 1
                 end
-            end
-            smart_terms[#smart_terms + 1] = term
-        end
-        local code_gen = { "for i = 1, #plugin_list do\nlocal target = plugin_list[i]:lower()", "" }
-        local add_magic
-        for i = 1, #smart_terms do
-            if magic[smart_terms[i]] then
-                add_magic = i > 1 and (magic[smart_terms[i]][1] .. magic[smart_terms[i]][2]) or magic[smart_terms[i]][2]
+    
+                local phrase = smart_string:sub(start, found and (qpos - 1) or len):lower()
+                tokens[#tokens + 1] = phrase
+    
+                if found then
+                    pos = qpos + 1
+                else
+                    log("Smart folder warning: unterminated quote; using rest of line\n")
+                    pos = len + 1
+                end
+    
             else
-                if add_magic then
-                    code_gen[2] = code_gen[2] .. add_magic:format("target", smart_terms[i])
-                    add_magic = nil
+                local start = pos
+                while pos <= len do
+                    local c = smart_string:byte(pos)
+                    if c == 32 or c == 9 or c == 40 or c == 41 then
+                        break
+                    end
+                    pos = pos + 1
+                end
+    
+                tokens[#tokens + 1] = smart_string:sub(start, pos - 1):lower()
+            end
+        end
+    
+        if #tokens == 0 then
+            return {}
+        end
+    
+        -- Build a dense plugin list so gaps in plugin_list cannot break matching
+        local plugin_indices = {}
+        local lower_plugins = {}
+    
+        for i, name in ipairs(plugin_list) do
+            if type(name) == "string" then
+                local dense_i = #plugin_indices + 1
+                plugin_indices[dense_i] = i
+                lower_plugins[dense_i] = name:lower()
+            end
+        end
+    
+        local plugin_count = #lower_plugins
+        if plugin_count == 0 then
+            return {}
+        end
+    
+        -- Cache term matches: term -> boolean array
+        local term_cache = {}
+    
+        local function clone_false_array()
+            local arr = {}
+            for i = 1, plugin_count do
+                arr[i] = false
+            end
+            return arr
+        end
+    
+        local function and_arrays(a, b)
+            for i = 1, plugin_count do
+                a[i] = a[i] and b[i]
+            end
+            return a
+        end
+        
+        local function or_arrays(a, b)
+            for i = 1, plugin_count do
+                a[i] = a[i] or b[i]
+            end
+            return a
+        end
+        
+        local function not_array(a)
+            for i = 1, plugin_count do
+                a[i] = not a[i]
+            end
+            return a
+        end
+    
+        local function get_term_array(term)
+            local cached = term_cache[term]
+            if cached then
+                return cached
+            end
+    
+            local arr = {}
+            for i = 1, plugin_count do
+                local str = lower_plugins[i]
+                arr[i] = (str ~= nil) and (str:find(term, 1, true) ~= nil) or false
+            end
+    
+            term_cache[term] = arr
+            return arr
+        end
+    
+        -- Recursive descent parser
+        local idx = 1
+        local function peek() return tokens[idx] end
+        local function consume()
+            local t = tokens[idx]
+            idx = idx + 1
+            return t
+        end
+    
+        local parse_expression
+    
+        local function is_primary_start(tok)
+            return tok and tok ~= "and" and tok ~= "or" and tok ~= ")"
+        end
+    
+        local function parse_primary()
+            local token = peek()
+    
+            if not token then
+                return nil, "unexpected end of expression"
+            end
+    
+            if token == "not" then
+                consume()
+                local arr, err = parse_primary()
+                if not arr then return nil, err end
+                return not_array(arr)
+    
+            elseif token == "(" then
+                consume()
+                local arr, err = parse_expression()
+                if not arr then return nil, err end
+    
+                if peek() ~= ")" then
+                    return nil, "missing ')'"
+                end
+    
+                consume()
+                return arr
+    
+            elseif token == "and" or token == "or" then
+                return nil, "unexpected operator '" .. token .. "'"
+    
+            else
+                consume()
+                return get_term_array(token)
+            end
+        end
+    
+        local function parse_and()
+            local left, err = parse_primary()
+            if not left then return nil, err end
+    
+            while true do
+                local op = peek()
+                if not op then
+                    break
+                end
+    
+                if op == "and" then
+                    consume()
+                    local right, err = parse_primary()
+                    if not right then return nil, err end
+                    left = and_arrays(left, right)
+    
+                elseif op == "not" then
+                    -- Keep your existing shorthand:
+                    -- A NOT B  -> A AND NOT B
+                    consume()
+                    local right, err = parse_primary()
+                    if not right then return nil, err end
+                    left = and_arrays(left, not_array(right))
+    
+                elseif is_primary_start(op) then
+                    -- Implicit AND:
+                    -- comp limiter  -> comp AND limiter
+                    local right, err = parse_primary()
+                    if not right then return nil, err end
+                    left = and_arrays(left, right)
+    
                 else
-                    code_gen[2] = i > 1 and code_gen[2] .. " and " .. ('%s:find(%q, 1, true)'):format("target", smart_terms[i]) or
-                        code_gen[2] .. ('%s:find(%q, 1, true)'):format("target", smart_terms[i])
+                    break
+                end
+            end
+    
+            return left
+        end
+    
+        local function parse_or()
+            local left, err = parse_and()
+            if not left then return nil, err end
+    
+            while true do
+                local op = peek()
+                if not op then
+                    break
+                end
+    
+                if op == "or" then
+                    consume()
+                    local right, err = parse_and()
+                    if not right then return nil, err end
+                    left = or_arrays(left, right)
+                else
+                    break
+                end
+            end
+    
+            return left
+        end
+    
+        parse_expression = function()
+            return parse_or()
+        end
+    
+        local result_array, err = parse_expression()
+        if not result_array then
+            log("Smart folder parse error: " .. err .. "\n")
+            return {}
+        end
+    
+        if idx <= #tokens then
+            local remaining = {}
+            for i = idx, #tokens do
+                remaining[#remaining + 1] = tokens[i]
+            end
+            log("Smart folder parse warning: extra tokens ignored: " .. table.concat(remaining, " ") .. "\n")
+        end
+    
+        -- Collect matching plugins
+        local smart_fx = {}
+        for i = 1, plugin_count do
+            if result_array[i] then
+                local original_idx = plugin_indices[i]
+                local name = plugin_list[original_idx]
+                if type(name) == "string" then
+                    smart_fx[#smart_fx + 1] = name
                 end
             end
         end
-        code_gen[2] = 'if ' .. code_gen[2] .. ' then'
-        code_gen[#code_gen + 1] = 'smart_fx[#smart_fx+1] = plugin_list[i]\nend\nend\n'
-        local code_str = table.concat(code_gen, "\n")
-        local func_env = { smart_fx = smart_fx, plugin_list = plugin_list, string = string }
-        local func = load(code_str, "SmartFolder", "t", func_env)
-        if func then pcall(func) end
+    
         return smart_fx
     end
 

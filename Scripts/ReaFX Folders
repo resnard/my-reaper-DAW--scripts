@@ -574,6 +574,7 @@ local f = io.open(FXFOLDERS_INI, "r")
                 else
                     plugin_names = { item_query:gsub('"', '') }
                 end
+                reaper.ShowConsoleMsg(tostring(#plugin_names))
                 for _, pname in ipairs(plugin_names) do
                     local ptype = "Unknown"
                     if pname:match("^VST3:") then ptype = "VST3"
@@ -628,10 +629,19 @@ local settings = {
     sort_ascending = true,
     status_bar_height = 50,
     insert_target = 0,
+    -- New keys for tag templates column
+    show_tag_templates = true,
+    tag_templates_width = 150,
+    tag_templates = {},
 }
 local notes_tags = {}
 
-settings = load_table(SETTINGS_FILE, settings)
+local loaded = load_table(SETTINGS_FILE, {})
+if loaded then
+    for k, v in pairs(loaded) do
+        settings[k] = v
+    end
+end
 notes_tags = load_table(NOTES_TAGS_FILE, {})
 
 if type(settings.pin_preset) ~= "table" then
@@ -709,6 +719,13 @@ local state = {
         temp_renames = 0,    -- increments when a plugin is renamed
         folder_tree = 0,     -- increments when folders are refreshed
     },
+    
+    tag_templates_sort_ascending = true,   -- default ascending
+    tag_templates_filter = "",             -- search text
+    new_tag_name = "",                     -- for the add popup
+    tag_templates_selected = {},           -- set of selected indices
+    last_clicked_template_idx = nil,
+    
 }
 
 -- ======================================================================
@@ -2367,6 +2384,21 @@ local function draw_header()
         end
         r.ImGui_SetItemTooltip(ctx, "Ctrl + K shortcut.\nKeep script open on insert")
         r.ImGui_Separator(ctx)
+        if r.ImGui_Selectable(ctx, settings.show_tag_templates and "Hide Tag Templates" or "Show Tag Templates") then
+            settings.show_tag_templates = not settings.show_tag_templates
+            if settings.show_tag_templates then
+                -- Optionally restore previous width? Already in settings.
+            end
+            save_table(SETTINGS_FILE, settings)
+            -- Invalidate cache? Not needed, but we need to rebuild the table layout.
+            -- The next frame will use the new setting.
+            if settings.show_tag_templates then
+                r.ImGui_SetNextWindowSize(ctx, 1100, 0, r.ImGui_Cond_Once())  -- 1100 width, keep height
+            else
+                r.ImGui_SetNextWindowSize(ctx, 900, 0, r.ImGui_Cond_Once())
+            end
+        end
+        r.ImGui_Separator(ctx)
        if r.ImGui_Selectable(ctx, "Help",0, r.ImGui_SelectableFlags_NoAutoClosePopups()) then
    --   local mouse_x, mouse_y = r.ImGui_GetMousePos(ctx)
       --  r.ImGui_SetNextWindowPos(ctx, mouse_x, mouse_y, r.ImGui_Cond_Appearing(), 0, 0)
@@ -2680,7 +2712,7 @@ local function draw_plugins_list()
     end
 
     -- Search input
-    r.ImGui_PushItemWidth(ctx, (r.ImGui_GetWindowWidth(ctx) * 0.58))
+    r.ImGui_PushItemWidth(ctx, (r.ImGui_GetWindowWidth(ctx) * 0.5))
     local changed, newval = r.ImGui_InputText(ctx, "##col3search", state.column3_search)
     if changed then state.column3_search = newval end
     r.ImGui_SameLine(ctx)
@@ -3064,6 +3096,246 @@ local function draw_plugins_list()
     end
 end
 
+local function draw_tag_templates_column()
+    r.ImGui_PushID(ctx, "tag_templates")
+
+    -- Header row with Add button, search, and sort
+    local header_avail = r.ImGui_GetContentRegionAvail(ctx)
+    -- Search input
+    r.ImGui_PushItemWidth(ctx, header_avail)  -- leave space for sort button
+    local changed, filter = r.ImGui_InputText(ctx, "##tag_search", state.tag_templates_filter, 256)
+    if changed then state.tag_templates_filter = filter end
+    r.ImGui_PopItemWidth(ctx)
+    if r.ImGui_Button(ctx, "+ Add") then
+        r.ImGui_OpenPopup(ctx, "AddTagTemplatePopup")
+        state.new_tag_name = ""
+    end
+    r.ImGui_SetItemTooltip(ctx, "Add a new tag template")
+    r.ImGui_SameLine(ctx)
+
+
+    -- Sort toggle button (click to toggle ascending/descending)
+    local sort_label = state.tag_templates_sort_ascending and "A→Z" or "Z→A"
+    if r.ImGui_Button(ctx, sort_label) then
+        state.tag_templates_sort_ascending = not state.tag_templates_sort_ascending
+    end
+    r.ImGui_SetItemTooltip(ctx, "Sort tags alphabetically")
+    r.ImGui_Separator(ctx)
+
+    -- Add popup with Save/Cancel
+    if r.ImGui_BeginPopup(ctx, "AddTagTemplatePopup", r.ImGui_WindowFlags_AlwaysAutoResize()) then
+        r.ImGui_Text(ctx, "New tag name:")
+        r.ImGui_SetKeyboardFocusHere(ctx, 0)
+        local changed, newbuf = r.ImGui_InputText(ctx, "##newtag", state.new_tag_name, 256, r.ImGui_InputTextFlags_None())
+        if changed then state.new_tag_name = newbuf end
+        r.ImGui_Spacing(ctx)
+        if r.ImGui_Button(ctx, "Save") then
+            local buf = state.new_tag_name:gsub("^%s+", ""):gsub("%s+$", "")
+            if buf ~= "" then
+                local exists = false
+                for _, t in ipairs(settings.tag_templates) do
+                    if t == buf then exists = true; break end
+                end
+                if not exists then
+                    table.insert(settings.tag_templates, buf)
+                    table.sort(settings.tag_templates)
+                    save_table(SETTINGS_FILE, settings)
+                end
+            end
+            r.ImGui_CloseCurrentPopup(ctx)
+        end
+        r.ImGui_SameLine(ctx)
+        if r.ImGui_Button(ctx, "Cancel") then
+            r.ImGui_CloseCurrentPopup(ctx)
+        end
+        r.ImGui_EndPopup(ctx)
+    end
+
+    -- Build filtered and sorted list
+    local filtered_tags = {}
+    local filter_lower = state.tag_templates_filter:lower()
+    for _, tag in ipairs(settings.tag_templates) do
+        if filter_lower == "" or tag:lower():find(filter_lower, 1, true) then
+            filtered_tags[#filtered_tags + 1] = tag
+        end
+    end
+    -- Sort
+    table.sort(filtered_tags, function(a, b)
+        if state.tag_templates_sort_ascending then
+            return a < b
+        else
+            return a > b
+        end
+    end)
+
+    -- For mapping back to original indices (needed for deletion and selection)
+    -- We need to know which original index each filtered tag corresponds to.
+    -- Build a mapping: filtered position -> original index
+    local original_indices = {}
+    for i, tag in ipairs(filtered_tags) do
+        for orig_idx, orig_tag in ipairs(settings.tag_templates) do
+            if orig_tag == tag then
+                original_indices[i] = orig_idx
+                break
+            end
+        end
+    end
+
+    -- Display tags
+    for i, tag in ipairs(filtered_tags) do
+        local orig_idx = original_indices[i]
+        r.ImGui_PushID(ctx, orig_idx)   -- use original index for ID stability
+
+        local is_selected = state.tag_templates_selected[orig_idx] == true
+        if r.ImGui_Selectable(ctx, tag, is_selected, r.ImGui_SelectableFlags_None()) then
+            local mods = r.ImGui_GetKeyMods(ctx)
+            local ctrl = (mods & r.ImGui_Mod_Ctrl()) ~= 0
+            local shift = (mods & r.ImGui_Mod_Shift()) ~= 0
+            if ctrl then
+                if is_selected then
+                    state.tag_templates_selected[orig_idx] = nil
+                else
+                    state.tag_templates_selected[orig_idx] = true
+                end
+            elseif shift and state.last_clicked_template_idx then
+                local start = math.min(state.last_clicked_template_idx, orig_idx)
+                local stop = math.max(state.last_clicked_template_idx, orig_idx)
+                for j = start, stop do
+                    state.tag_templates_selected[j] = true
+                end
+            else
+                state.tag_templates_selected = { [orig_idx] = true }
+            end
+            state.last_clicked_template_idx = orig_idx
+        end
+
+        -- Context menu for the clicked tag
+        if r.ImGui_BeginPopupContextItem(ctx) then
+            -- Delete this template (only for the clicked tag)
+            if r.ImGui_Selectable(ctx, "Delete template") then
+                r.ImGui_OpenPopup(ctx, "DeleteTagConfirm_" .. orig_idx)
+            end
+
+            -- Gather plugins selected in the main view
+            local selected_plugins = {}
+            if state.current_view == "plugins" then
+                for name in pairs(state.selected_plugins) do
+                    selected_plugins[#selected_plugins + 1] = name
+                end
+            else
+                for idx in pairs(state.chain_selected_set) do
+                    local item = state.chain_plugins[idx]
+                    if item then selected_plugins[#selected_plugins + 1] = item.name end
+                end
+            end
+
+            if #selected_plugins > 0 then
+                -- Determine set of tags to apply: include clicked tag plus any selected tags
+                local tags_to_apply = {}
+                -- Add clicked tag (always)
+                tags_to_apply[tag] = true
+                -- Add other selected tags
+                for idx, _ in pairs(state.tag_templates_selected) do
+                    if idx ~= orig_idx then
+                        tags_to_apply[settings.tag_templates[idx]] = true
+                    end
+                end
+                local tag_list = {}
+                for t in pairs(tags_to_apply) do
+                    tag_list[#tag_list + 1] = t
+                end
+                table.sort(tag_list)
+
+                if #tag_list > 0 then
+                    r.ImGui_Separator(ctx)
+                    if r.ImGui_Selectable(ctx, "Add selected tags to selected plugins") then
+                        for _, t in ipairs(tag_list) do
+                            for _, name in ipairs(selected_plugins) do
+                                local nt = notes_tags[name]
+                                if not nt then
+                                    nt = {}
+                                    notes_tags[name] = nt
+                                end
+                                if not nt.tags then nt.tags = {} end
+                                local found = false
+                                for _, existing in ipairs(nt.tags) do
+                                    if existing == t then found = true; break end
+                                end
+                                if not found then
+                                    table.insert(nt.tags, t)
+                                    table.sort(nt.tags)
+                                end
+                            end
+                        end
+                        save_table(NOTES_TAGS_FILE, notes_tags)
+                        bump_notes_tags_version()
+                    end
+                    if r.ImGui_Selectable(ctx, "Remove selected tags from selected plugins") then
+                        for _, t in ipairs(tag_list) do
+                            for _, name in ipairs(selected_plugins) do
+                                local nt = notes_tags[name]
+                                if nt and nt.tags then
+                                    local new_tags = {}
+                                    for _, existing in ipairs(nt.tags) do
+                                        if existing ~= t then new_tags[#new_tags + 1] = existing end
+                                    end
+                                    nt.tags = new_tags
+                                end
+                            end
+                        end
+                        save_table(NOTES_TAGS_FILE, notes_tags)
+                        bump_notes_tags_version()
+                    end
+                end
+            end
+            r.ImGui_EndPopup(ctx)
+        end
+
+        -- Delete confirmation popup for this tag
+        local confirm_id = "DeleteTagConfirm_" .. orig_idx
+        if r.ImGui_BeginPopupModal(ctx, confirm_id, nil, r.ImGui_WindowFlags_AlwaysAutoResize()) then
+            r.ImGui_Text(ctx, "Delete template '" .. tag .. "'?\nThis will also remove this tag from all plugins.")
+            if r.ImGui_Button(ctx, "Yes") then
+                -- Remove tag from all plugins
+                for name, nt in pairs(notes_tags) do
+                    if nt.tags then
+                        local new_tags = {}
+                        for _, t in ipairs(nt.tags) do
+                            if t ~= tag then new_tags[#new_tags + 1] = t end
+                        end
+                        nt.tags = new_tags
+                    end
+                end
+                -- Remove from templates
+                table.remove(settings.tag_templates, orig_idx)
+                table.sort(settings.tag_templates)
+                -- Update selected set (remove any references)
+                for idx in pairs(state.tag_templates_selected) do
+                    if idx == orig_idx then
+                        state.tag_templates_selected[idx] = nil
+                    elseif idx > orig_idx then
+                        state.tag_templates_selected[idx-1] = true
+                        state.tag_templates_selected[idx] = nil
+                    end
+                end
+                save_table(SETTINGS_FILE, settings)
+                save_table(NOTES_TAGS_FILE, notes_tags)
+                bump_notes_tags_version()
+                r.ImGui_CloseCurrentPopup(ctx)
+            end
+            r.ImGui_SameLine(ctx)
+            if r.ImGui_Button(ctx, "No") then
+                r.ImGui_CloseCurrentPopup(ctx)
+            end
+            r.ImGui_EndPopup(ctx)
+        end
+
+        r.ImGui_PopID(ctx)
+    end
+
+    r.ImGui_PopID(ctx)
+end
+
 -- status bar
 local function draw_status_bar()
     if not settings.status_bar_height then settings.status_bar_height = 50 end
@@ -3228,8 +3500,9 @@ local function loop()
         r.ShowConsoleMsg("ImGui context lost. Exiting.\n")
         return
     end
-    r.ImGui_SetNextWindowSize(ctx, 900, 600, r.ImGui_Cond_FirstUseEver())
-    local visible, open = r.ImGui_Begin(ctx, "ReaFX Folder", true)
+r.ImGui_SetNextWindowSize(ctx, 800, 300, r.ImGui_Cond_FirstUseEver())
+r.ImGui_SetNextWindowSizeConstraints(ctx, 500, 400, 1300, 900, nil)
+    local visible, open = r.ImGui_Begin(ctx, "ReaFX Folder", true, r.ImGui_WindowFlags_AlwaysAutoResize())
     if visible then
         draw_header()
         r.ImGui_Separator(ctx)
@@ -3239,26 +3512,40 @@ local function loop()
         local status_height = settings.status_bar_height
         local table_height = window_height - (current_y + 20) - status_height
         if table_height < 100 then table_height = 100 end
-        if r.ImGui_BeginChild(ctx, "MainTableRegion", 0, table_height) then
-            if r.ImGui_BeginTable(ctx, "main_columns", 2, r.ImGui_TableFlags_Resizable()) then
-                r.ImGui_TableSetupColumn(ctx, "Folders", r.ImGui_TableColumnFlags_WidthFixed() | r.ImGui_TableColumnFlags_NoResize(), 180)
-                r.ImGui_TableSetupColumn(ctx, "Contents", r.ImGui_TableColumnFlags_WidthStretch(), 0)
+        if r.ImGui_BeginChild(ctx, "MainTableRegion", 0, table_height, reaper.ImGui_ChildFlags_AutoResizeX()) then
+            local num_columns = settings.show_tag_templates and 3 or 2
+            if r.ImGui_BeginTable(ctx, "main_columns", num_columns, reaper.ImGui_TableFlags_None()) then
+                r.ImGui_TableSetupColumn(ctx, "Folders", r.ImGui_TableColumnFlags_WidthFixed(), 180)
+                r.ImGui_TableSetupColumn(ctx, "Contents", reaper.ImGui_TableColumnFlags_WidthFixed(), 600)
+                if settings.show_tag_templates then
+                    r.ImGui_TableSetupColumn(ctx, "Tag Templates", r.ImGui_TableColumnFlags_WidthFixed(), settings.tag_templates_width)
+                end
                 r.ImGui_TableHeadersRow(ctx)
+            
                 r.ImGui_TableNextColumn(ctx)
-                draw_column2()
+                draw_column2()          -- folders
+            
                 r.ImGui_TableNextColumn(ctx)
                 if state.current_view == "plugins" then
                     draw_plugins_list()
                 else
                     draw_chain_list()
                 end
+            
+                if settings.show_tag_templates then
+                    r.ImGui_TableNextColumn(ctx)
+                    draw_tag_templates_column()
+                end
+            
                 r.ImGui_EndTable(ctx)
+
             end
+             draw_status_bar()
             r.ImGui_EndChild(ctx)
         end
         draw_chain_rename_popup()
         draw_rename_popup()
-        draw_status_bar()
+    --    draw_status_bar()
         draw_pin_popup()
         draw_note_popup()
         draw_tag_popup()

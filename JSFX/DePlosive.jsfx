@@ -1,0 +1,245 @@
+desc:De-Plosive BETA (Res)
+
+slider1:120<20,200,1>Sidechain LPF (Hz)
+slider2:-18<-48,0,0.5>Manual Threshold (dBFS)
+slider3:50<0,100,1>Reduction (%)
+slider4:35<0,100,1>Softness (%)
+slider5:100<0,100,1>Delta LPF (%)
+slider6:100<0,100,1>Proximity (%)
+slider7:2<0,2,1{Detector Band,Delta,Processed}>Monitor
+slider8:5<0,10,0.5>Lookahead (ms)
+slider9:28<5,100,1>Gain Release (ms)
+
+@init
+// Adaptive De-Plosive v1.6
+// Manual threshold only.
+// Delta processing order: Softness -> Delta LPF -> restoration.
+// Delta monitor is independent of Reduction.
+
+bufsize = 8192;
+bufmask = bufsize - 1;
+
+memset(0, 0, bufsize * 2);
+
+writePos = 0;
+
+scPrevL = 0;
+scPrevR = 0;
+scHP_L = 0;
+scHP_R = 0;
+scLP1L = 0;
+scLP1R = 0;
+scLP2L = 0;
+scLP2R = 0;
+
+aLP1L = 0;
+aLP1R = 0;
+
+dLP1L = 0;
+dLP1R = 0;
+
+oLP2L = 0;
+oLP2R = 0;
+
+gain = 1;
+detector = 0;
+
+@slider
+scCut = slider1;
+threshold = 10 ^ (slider2 / 20);
+
+reduction = slider3 / 100;
+softness = slider4 / 100;
+deltaLPF = slider5 / 100;
+proximity = slider6 / 100;
+
+monitorMode = slider7;
+
+lookaheadSamples = floor(slider8 * 0.001 * srate);
+lookaheadSamples = min(max(lookaheadSamples, 0), bufsize - 1);
+
+gainAtt = exp(-1 / (srate * 0.00015));
+gainRel = exp(-1 / (srate * slider9 * 0.001));
+
+scLPcoef = 1 - exp(-6.283185307179586 * scCut / srate);
+dcR = exp(-6.283185307179586 * 20 / srate);
+
+// Softness smoothing: approximately 2 ms time constant.
+softCoef = 1 - exp(-1 / (srate * 0.002));
+
+// Delta LPF:
+// 0% = maximum filtering, 500 Hz cutoff.
+// 100% = bypass.
+// The cutoff rises exponentially between these settings.
+deltaLPFCut = 500 * (40 ^ deltaLPF);
+deltaLPFcoef = 1 - exp(-6.283185307179586 * deltaLPFCut / srate);
+
+// Proximity shaping coefficient.
+proxCut = 100;
+proxCoef = 1 - exp(-6.283185307179586 * proxCut / srate);
+
+@sample
+inL = spl0;
+inR = spl1;
+
+// ------------------------------------------------------------
+// 1. Sidechain filtering and peak detection
+// ------------------------------------------------------------
+
+// DC blocker
+scInL = inL - scPrevL + dcR * scHP_L;
+scInR = inR - scPrevR + dcR * scHP_R;
+
+scPrevL = inL;
+scPrevR = inR;
+
+scHP_L = scInL;
+scHP_R = scInR;
+
+// Two cascaded low-pass stages
+scLP1L += scLPcoef * (scInL - scLP1L);
+scLP1R += scLPcoef * (scInR - scLP1R);
+
+scLP2L += scLPcoef * (scLP1L - scLP2L);
+scLP2R += scLPcoef * (scLP1R - scLP2R);
+
+scL = scLP2L;
+scR = scLP2R;
+
+// Peak detector
+detector = max(abs(scL), abs(scR));
+
+// ------------------------------------------------------------
+// 2. Manual threshold gain computer
+// ------------------------------------------------------------
+
+thresholdSafe = max(threshold, 0.000001);
+detectorSafe = max(detector, 0.000001);
+
+targetGain = detector > thresholdSafe
+           ? thresholdSafe / detectorSafe
+           : 1;
+
+targetGain = min(max(targetGain, 0), 1);
+
+// Fast attack, smoothed release.
+targetGain < gain ? (
+  gain = gainAtt * gain + (1 - gainAtt) * targetGain;
+) : (
+  gain = gainRel * gain + (1 - gainRel) * targetGain;
+);
+
+// ------------------------------------------------------------
+// 3. Audio delay buffer for optional lookahead
+// ------------------------------------------------------------
+
+bufL = writePos * 2;
+bufR = bufL + 1;
+
+mem[bufL] = inL;
+mem[bufR] = inR;
+
+readPos = (writePos - lookaheadSamples) & bufmask;
+
+readL = mem[readPos * 2];
+readR = mem[readPos * 2 + 1];
+
+writePos = (writePos + 1) & bufmask;
+
+// ------------------------------------------------------------
+// 4. Broadband processing and delta calculation
+// ------------------------------------------------------------
+
+processedL = readL * gain;
+processedR = readR * gain;
+
+// Delta is the difference between delayed dry and processed audio.
+deltaL = readL - processedL;
+deltaR = readR - processedR;
+
+// ------------------------------------------------------------
+// 5. Softness processing
+// ------------------------------------------------------------
+
+// Smooth the delta waveform.
+aLP1L += softCoef * (deltaL - aLP1L);
+aLP1R += softCoef * (deltaR - aLP1R);
+
+softDeltaL = aLP1L;
+softDeltaR = aLP1R;
+
+// Blend raw and smoothed delta.
+deltaSoftL = deltaL * (1 - softness)
+           + softDeltaL * softness;
+
+deltaSoftR = deltaR * (1 - softness)
+           + softDeltaR * softness;
+
+// ------------------------------------------------------------
+// 6. Delta LPF processing
+// ------------------------------------------------------------
+
+// Filter the delta AFTER Softness.
+dLP1L += deltaLPFcoef * (deltaSoftL - dLP1L);
+dLP1R += deltaLPFcoef * (deltaSoftR - dLP1R);
+
+// 100% bypasses the additional filter.
+// 0% uses the 500 Hz low-pass output.
+deltaLPF < 1 ? (
+  deltaFinalL = dLP1L;
+  deltaFinalR = dLP1R;
+) : (
+  deltaFinalL = deltaSoftL;
+  deltaFinalR = deltaSoftR;
+);
+
+// ------------------------------------------------------------
+// 7. Delta monitor tap
+// ------------------------------------------------------------
+
+// Monitor the shaped delta BEFORE Reduction is applied.
+// This remains audible even when Reduction is 100%.
+monitorDeltaL = deltaFinalL;
+monitorDeltaR = deltaFinalR;
+
+// ------------------------------------------------------------
+// 8. Restore the shaped delta
+// ------------------------------------------------------------
+
+// Reduction 0% = full delta restoration.
+// Reduction 100% = no delta restoration.
+outL = processedL + deltaFinalL * (1 - reduction);
+outR = processedR + deltaFinalR * (1 - reduction);
+
+// ------------------------------------------------------------
+// 9. Proximity control
+// ------------------------------------------------------------
+
+// Low-frequency shaping retained from the previous version.
+// Neutral at 100%; increasing effect as the slider is lowered.
+oLP2L += proxCoef * (outL - oLP2L);
+oLP2R += proxCoef * (outR - oLP2R);
+
+proximityComp = (1 - proximity) * 0.35;
+
+outL -= oLP2L * proximityComp;
+outR -= oLP2R * proximityComp;
+
+// ------------------------------------------------------------
+// 10. Monitor output
+// ------------------------------------------------------------
+
+slider7 == 0 ? (
+  // Detector Band
+  spl0 = scL;
+  spl1 = scR;
+) : slider7 == 1 ? (
+  // Delta after Softness and Delta LPF,
+  // before the Reduction mix.
+  spl0 = monitorDeltaL;
+  spl1 = monitorDeltaR;
+) : (
+  // Final processed output
+  spl0 = outL;
+  spl1 = outR;
+);

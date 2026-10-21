@@ -1,0 +1,338 @@
+desc:De-Plosive 0.2 (Res)
+
+slider1:120<20,200,1>Sidechain LPF (Hz)
+slider2:-18<-48,0,0.5>Manual Threshold (dBFS)
+slider3:50<0,100,1>Reduction (%)
+slider4:1300<300,8000,50>Plosive LPF (Hz)
+slider5:50<0,100,1>Plosive LPF Mix (%)
+slider6:100<0,100,1>Delta LPF (%)
+slider7:100<0,100,1>Proximity (%)
+slider8:2<0,2,1{Detector Band,Delta,Processed}>Monitor
+slider9:5<0,10,0.5>Lookahead (ms)
+slider10:28<5,100,1>Gain Release (ms)
+
+@init
+// Adaptive De-Plosive v1.8
+// Broadband gain reduction + delta restoration.
+// Lookahead peak window aligned to delayed audio.
+// Reports host PDC.
+// Plosive LPF affects the reduced signal only.
+// Delta shaping preserves unity reconstruction at 0% Reduction.
+// Proximity uses a proper RBJ low-shelf biquad.
+//
+// Experimental source. Not yet compiled or auditioned in REAPER.
+
+bufsize = 8192;
+bufmask = bufsize - 1;
+
+// Audio ring buffer occupies mem[0..16383].
+memset(0, 0, bufsize * 2);
+
+writePos = 0;
+
+// Monotonic detector queue.
+// Values: mem[16384..24575]
+// Sample indices: mem[24576..32767]
+queueValueBase = 16384;
+queueIndexBase = 24576;
+
+queueHead = 0;
+queueTail = 0;
+sampleCounter = 0;
+
+scPrevL = 0;
+scPrevR = 0;
+scHP_L = 0;
+scHP_R = 0;
+
+scLP1L = 0;
+scLP1R = 0;
+scLP2L = 0;
+scLP2R = 0;
+
+// Delta LPF state
+dLP1L = 0;
+dLP1R = 0;
+
+// Plosive LPF biquad state
+plZ1L = 0;
+plZ2L = 0;
+plZ1R = 0;
+plZ2R = 0;
+
+// Proximity shelf biquad state
+proxZ1L = 0;
+proxZ2L = 0;
+proxZ1R = 0;
+proxZ2R = 0;
+
+gain = 1;
+detector = 0;
+
+@slider
+scCut = slider1;
+threshold = 10 ^ (slider2 / 20);
+
+reduction = slider3 / 100;
+plosiveLPFCut = slider4;
+plosiveLPFMix = slider5 / 100;
+deltaLPF = slider6 / 100;
+proximity = slider7 / 100;
+monitorMode = slider8;
+
+// Lookahead and host delay compensation
+lookaheadSamples = floor(slider9 * 0.001 * srate);
+lookaheadSamples = min(max(lookaheadSamples, 0), bufsize - 1);
+
+pdc_delay = lookaheadSamples;
+pdc_bot_ch = 0;
+pdc_top_ch = 2;
+
+// Gain envelope
+gainAtt = exp(-1 / (srate * 0.00015));
+gainRel = exp(-1 / (srate * slider10 * 0.001));
+
+// Sidechain filtering
+scLPcoef = 1 - exp(-6.283185307179586 * scCut / srate);
+dcR = exp(-6.283185307179586 * 20 / srate);
+
+// Delta LPF:
+// 0% = 500 Hz; 100% = bypass.
+deltaLPFCut = 500 * (40 ^ deltaLPF);
+deltaLPFcoef = 1 - exp(-6.283185307179586 * deltaLPFCut / srate);
+
+// Plosive LPF: RBJ second-order Butterworth low-pass.
+// Clamp below Nyquist for coefficient stability.
+plCut = min(max(plosiveLPFCut, 20), srate * 0.45);
+
+plW0 = 6.283185307179586 * plCut / srate;
+plCos = cos(plW0);
+plSin = sin(plW0);
+plAlpha = plSin / (2 * 0.7071067811865476);
+
+plA0 = 1 + plAlpha;
+
+plB0 = ((1 - plCos) * 0.5) / plA0;
+plB1 = (1 - plCos) / plA0;
+plB2 = ((1 - plCos) * 0.5) / plA0;
+
+plA1 = (-2 * plCos) / plA0;
+plA2 = (1 - plAlpha) / plA0;
+
+// Proximity: proper RBJ low shelf.
+// 100% = neutral.
+// 0% = approximately -3.74 dB at low frequencies.
+// This is tonal shaping, not a physical distance model.
+proxGainDB = -3.74 * (1 - proximity);
+proxA = 10 ^ (proxGainDB / 40);
+
+proxCut = 100;
+proxW0 = 6.283185307179586 * proxCut / srate;
+proxCos = cos(proxW0);
+proxSin = sin(proxW0);
+
+// Shelf slope S = 1
+proxAlpha = (proxSin * 0.5) *
+            sqrt((proxA + 1 / proxA) * (1 - 1) + 2);
+
+proxBeta = 2 * sqrt(proxA) * proxAlpha;
+
+proxA0 = (proxA + 1) +
+         (proxA - 1) * proxCos + proxBeta;
+
+proxB0 = proxA *
+         ((proxA + 1) - (proxA - 1) * proxCos + proxBeta)
+         / proxA0;
+
+proxB1 = 2 * proxA *
+         ((proxA - 1) - (proxA + 1) * proxCos)
+         / proxA0;
+
+proxB2 = proxA *
+         ((proxA + 1) - (proxA - 1) * proxCos - proxBeta)
+         / proxA0;
+
+proxA1 = -2 *
+         ((proxA - 1) + (proxA + 1) * proxCos)
+         / proxA0;
+
+proxA2 = ((proxA + 1) + (proxA - 1) * proxCos - proxBeta)
+         / proxA0;
+
+@sample
+inL = spl0;
+inR = spl1;
+
+// 1. Sidechain filtering and stereo-linked peak detection
+scInL = inL - scPrevL + dcR * scHP_L;
+scInR = inR - scPrevR + dcR * scHP_R;
+
+scPrevL = inL;
+scPrevR = inR;
+
+scHP_L = scInL;
+scHP_R = scInR;
+
+scLP1L += scLPcoef * (scInL - scLP1L);
+scLP1R += scLPcoef * (scInR - scLP1R);
+
+scLP2L += scLPcoef * (scLP1L - scLP2L);
+scLP2R += scLPcoef * (scLP1R - scLP2R);
+
+scL = scLP2L;
+scR = scLP2R;
+
+detector = max(abs(scL), abs(scR));
+
+// 2. Sliding maximum over the lookahead window.
+//
+// For the audio sample read from n-lookaheadSamples,
+// inspect detector samples from n-lookaheadSamples through n.
+// This anticipates the transient while keeping its gain envelope
+// aligned with the delayed audio sample.
+//
+// The monotonic queue avoids scanning the whole window per sample.
+
+// Remove queue-tail entries no larger than the current detector.
+while (queueTail > queueHead &&
+       mem[queueValueBase + ((queueTail - 1) & bufmask)] <= detector) (
+  queueTail -= 1;
+);
+
+// Add current detector and its sample index.
+mem[queueValueBase + (queueTail & bufmask)] = detector;
+mem[queueIndexBase + (queueTail & bufmask)] = sampleCounter;
+queueTail += 1;
+
+// Discard entries older than the current lookahead window.
+oldestAllowed = sampleCounter - lookaheadSamples;
+
+while (queueTail > queueHead &&
+       mem[queueIndexBase + (queueHead & bufmask)] < oldestAllowed) (
+  queueHead += 1;
+);
+
+lookaheadPeak = mem[queueValueBase + (queueHead & bufmask)];
+
+// 3. Gain computer from the lookahead peak
+thresholdSafe = max(threshold, 0.000001);
+peakSafe = max(lookaheadPeak, 0.000001);
+
+targetGain = lookaheadPeak > thresholdSafe
+           ? thresholdSafe / peakSafe
+           : 1;
+
+targetGain = min(max(targetGain, 0), 1);
+
+targetGain < gain ? (
+  gain = gainAtt * gain + (1 - gainAtt) * targetGain;
+) : (
+  gain = gainRel * gain + (1 - gainRel) * targetGain;
+);
+
+// Advance detector sample clock
+sampleCounter += 1;
+
+// 4. Delay audio by the selected lookahead amount
+bufL = writePos * 2;
+bufR = bufL + 1;
+
+mem[bufL] = inL;
+mem[bufR] = inR;
+
+readPos = (writePos - lookaheadSamples) & bufmask;
+
+readL = mem[readPos * 2];
+readR = mem[readPos * 2 + 1];
+
+writePos = (writePos + 1) & bufmask;
+
+// 5. Broadband gain reduction
+processedL = readL * gain;
+processedR = readR * gain;
+
+// Raw removed-signal delta
+deltaL = readL - processedL;
+deltaR = readR - processedR;
+
+// 6. Delta LPF
+dLP1L += deltaLPFcoef * (deltaL - dLP1L);
+dLP1R += deltaLPFcoef * (deltaR - dLP1R);
+
+deltaLPF < 1 ? (
+  deltaFinalL = dLP1L;
+  deltaFinalR = dLP1R;
+) : (
+  deltaFinalL = deltaL;
+  deltaFinalR = deltaR;
+);
+
+// Delta monitor remains independent of Reduction
+monitorDeltaL = deltaFinalL;
+monitorDeltaR = deltaFinalR;
+
+// 7. Make delta restoration mathematically consistent.
+//
+// At Reduction = 0, restore the RAW delta, even when Delta LPF
+// is active. Therefore processed + delta = delayed dry audio.
+//
+// As Reduction increases, shaped delta progressively replaces
+// raw delta in the restoration path.
+deltaForOutputL = deltaL +
+                  reduction * (deltaFinalL - deltaL);
+
+deltaForOutputR = deltaR +
+                  reduction * (deltaFinalR - deltaR);
+
+outL = processedL + deltaForOutputL * (1 - reduction);
+outR = processedR + deltaForOutputR * (1 - reduction);
+
+// 8. Plosive LPF on the reduced signal.
+//
+// The biquad runs continuously to keep its state warm.
+// Its spectral correction is mixed in only during gain reduction.
+plFilteredL = plB0 * processedL + plZ1L;
+plZ1L = plB1 * processedL - plA1 * plFilteredL + plZ2L;
+plZ2L = plB2 * processedL - plA2 * plFilteredL;
+
+plFilteredR = plB0 * processedR + plZ1R;
+plZ1R = plB1 * processedR - plA1 * plFilteredR + plZ2R;
+plZ2R = plB2 * processedR - plA2 * plFilteredR;
+
+// The effect is controlled by gain reduction, Reduction, and Mix.
+// At Reduction = 0, this correction is exactly zero.
+reductionActivity = (1 - gain) * reduction;
+plosiveLPFAmount = reductionActivity * plosiveLPFMix;
+
+outL += plosiveLPFAmount * (plFilteredL - processedL);
+outR += plosiveLPFAmount * (plFilteredR - processedR);
+
+// 9. Proximity low shelf
+//
+// Continue processing the filter at all settings so its state
+// remains warm when the control is moved.
+proxFilteredL = proxB0 * outL + proxZ1L;
+proxZ1L = proxB1 * outL - proxA1 * proxFilteredL + proxZ2L;
+proxZ2L = proxB2 * outL - proxA2 * proxFilteredL;
+
+proxFilteredR = proxB0 * outR + proxZ1R;
+proxZ1R = proxB1 * outR - proxA1 * proxFilteredR + proxZ2R;
+proxZ2R = proxB2 * outR - proxA2 * proxFilteredR;
+
+// Exact neutral bypass at 100%.
+proximity < 0.999999 ? (
+  outL = proxFilteredL;
+  outR = proxFilteredR;
+);
+
+// 10. Monitor
+monitorMode == 0 ? (
+  spl0 = scL;
+  spl1 = scR;
+) : monitorMode == 1 ? (
+  spl0 = monitorDeltaL;
+  spl1 = monitorDeltaR;
+) : (
+  spl0 = outL;
+  spl1 = outR;
+);
